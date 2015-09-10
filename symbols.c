@@ -344,7 +344,7 @@ void symbols_init (void)
 	fp = fopen("symbols-new.txt", "r");
 #ifndef __WIN32__
 	if (fp == NULL) {
-	  fp = fopen("/usr/share/direwolf/symbols-new.txt", "r");
+	  fp = fopen("DW_INSTALLDIR/share/direwolf/symbols-new.txt", "r");
 	}
 #endif
 	if (fp == NULL) {

@@ -3596,7 +3596,7 @@ static void decode_tocall (decode_aprs_t *A, char *dest)
 	  fp = fopen("tocalls.txt", "r");
 #ifndef __WIN32__
 	  if (fp == NULL) {
-	    fp = fopen("/usr/share/direwolf/tocalls.txt", "r");
+	    fp = fopen("DW_INSTALLDIR/share/direwolf/tocalls.txt", "r");
 	  }
 #endif
 	  if (fp != NULL) {
