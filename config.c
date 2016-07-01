@@ -795,7 +795,7 @@ void config_init (char *fname, struct audio_s *p_audio_config,
 	  p = getenv("HOME");
 	  if (p != NULL) {
 	    strlcpy (filepath, p, sizeof(filepath));
-	    strlcat (filepath, "/direwolf.conf", sizeof(filepath));
+	    strlcat (filepath, "/.direwolf.conf", sizeof(filepath));
 	    fp = fopen (filepath, "r");
 	  } 
 	}
