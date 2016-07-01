@@ -268,7 +268,7 @@ static const char *search_locations[] = {
 	(const char *) "symbols-new.txt",
 #ifndef __WIN32__
 	(const char *) "/usr/share/direwolf/symbols-new.txt",
-	(const char *) "/usr/local/share/direwolf/symbols-new.txt",
+	(const char *) "INSTALLDIR/share/direwolf/symbols-new.txt",
 #endif
 	(const char *) NULL
 };

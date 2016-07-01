@@ -1103,7 +1103,7 @@ static void usage (char **argv)
   
 #if __WIN32__
 #else
-	dw_printf ("Complete documentation can be found in /usr/local/share/doc/direwolf.\n");
+	dw_printf ("Complete documentation can be found in INSTALLDIR/share/doc/direwolf.\n");
 #endif
 	exit (EXIT_FAILURE);
 }

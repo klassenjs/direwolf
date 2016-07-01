@@ -4,6 +4,19 @@
 
 APPS := direwolf decode_aprs text2tt tt2text ll2utm utm2ll aclients atest log2gpx gen_packets ttcalc
 
+# Where should we install it?
+
+# My understanding, of the convention, is that something you compile
+# from source, that is not a standard part of the operating system,
+# should go in /usr/local/bin.
+
+# However, if you are preparing a "binary" DEB or RPM package, the
+# installation location should be /usr/bin.
+
+# This is a step in the right direction but not sufficient to use /usr instead.
+# Eventually I'd like to have targets here to build the .DEB and .RPM packages.
+INSTALLDIR := /usr/local
+
 all :  $(APPS) direwolf.desktop direwolf.conf
 	@echo " "
 	@echo "Next step - install with:"
@@ -12,7 +25,7 @@ all :  $(APPS) direwolf.desktop direwolf.conf
 	@echo " "
 
 CC := gcc
-CFLAGS := -O3 -pthread -Igeotranz
+CFLAGS := -O3 -pthread -Igeotranz -DINSTALLDIR=$(INSTALLDIR)
 
 LDFLAGS := -lm -lpthread -lrt
 
@@ -408,20 +421,6 @@ direwolf.conf : generic.conf
 	egrep '^C|^L' generic.conf | cut -c2-999 > direwolf.conf
 
 
-# Where should we install it?
-
-# My understanding, of the convention, is that something you compile
-# from source, that is not a standard part of the operating system,
-# should go in /usr/local/bin.
-
-# However, if you are preparing a "binary" DEB or RPM package, the
-# installation location should be /usr/bin.
-
-# This is a step in the right direction but not sufficient to use /usr instead.
-# Eventually I'd like to have targets here to build the .DEB and .RPM packages.
-
-INSTALLDIR := /usr/local
-
 # Command to "install" to system directories.  Use "ginstall" for Mac.
 
 INSTALL=install
@@ -446,7 +445,7 @@ else
 endif
 	@echo 'Name=Dire Wolf' >> $@
 	@echo 'Comment=APRS Soundcard TNC' >> $@
-	@echo 'Icon=/usr/share/direwolf/dw-icon.png' >> $@
+	@echo 'Icon=$(INSTALLDIR)/direwolf/dw-icon.png' >> $@
 	@echo "Path=$(HOME)" >> $@
 	@echo '#Terminal=true' >> $@
 	@echo 'Categories=HamRadio' >> $@
@@ -490,11 +489,11 @@ install : $(APPS) direwolf.conf tocalls.txt symbols-new.txt symbolsX.txt dw-icon
 #
 # Misc. data such as "tocall" to system mapping.
 #
-	$(INSTALL) -D --mode=644 tocalls.txt /usr/share/direwolf/tocalls.txt
-	$(INSTALL) -D --mode=644 symbols-new.txt /usr/share/direwolf/symbols-new.txt
-	$(INSTALL) -D --mode=644 symbolsX.txt /usr/share/direwolf/symbolsX.txt
-	$(INSTALL) -D --mode=644 dw-icon.png /usr/share/direwolf/dw-icon.png
-	$(INSTALL) -D --mode=644 direwolf.desktop /usr/share/applications/direwolf.desktop
+	$(INSTALL) -D --mode=644 tocalls.txt $(INSTALLDIR)/direwolf/tocalls.txt
+	$(INSTALL) -D --mode=644 symbols-new.txt $(INSTALLDIR)/direwolf/symbols-new.txt
+	$(INSTALL) -D --mode=644 symbolsX.txt $(INSTALLDIR)/direwolf/symbolsX.txt
+	$(INSTALL) -D --mode=644 dw-icon.png $(INSTALLDIR)/direwolf/dw-icon.png
+	$(INSTALL) -D --mode=644 direwolf.desktop $(INSTALLDIR)/applications/direwolf.desktop
 #
 # Documentation.  Various plain text files and PDF.
 #
@@ -574,7 +573,7 @@ endif
 .PHONY: install-rpi
 install-rpi : dw-start.sh
 	cp dw-start.sh ~
-	ln -f -s /usr/share/applications/direwolf.desktop ~/Desktop/direwolf.desktop
+	ln -f -s $(INSTALLDIR)/applications/direwolf.desktop ~/Desktop/direwolf.desktop
 
 
 

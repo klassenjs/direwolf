@@ -3636,7 +3636,7 @@ static const char *search_locations[] = {
 	(const char *) "tocalls.txt",
 #ifndef __WIN32__
 	(const char *) "/usr/share/direwolf/tocalls.txt",
-	(const char *) "/usr/local/share/direwolf/tocalls.txt",
+	(const char *) "INSTALLDIR/share/direwolf/tocalls.txt",
 #endif
 	(const char *) NULL
 };
