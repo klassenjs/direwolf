@@ -60,7 +60,7 @@
 #if ENABLE_GPS
 #include <gps.h>
 
-#if GPSD_API_MAJOR_VERSION != 5
+#if GPSD_API_MAJOR_VERSION !=6
 #error libgps API version might be incompatible.
 #endif
 
