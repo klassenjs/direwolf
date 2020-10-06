@@ -204,7 +204,7 @@ CFLAGS += -DENABLE_GPS
 LDLIBS += -lgps
 
 
-INSTALLDIR := /home/jimk/apps/direwolf
+INSTALLDIR := /home/jimk/apps/SDR/direwolf
 CFLAGS += -DDW_INSTALLDIR=$(INSTALLDIR)
 
 # Name of current directory.
