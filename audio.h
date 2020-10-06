@@ -12,6 +12,10 @@
 #ifndef AUDIO_H
 #define AUDIO_H 1
 
+#ifdef USE_HAMLIB
+#include <hamlib/rig.h>
+#endif
+
 #include "direwolf.h"		/* for MAX_CHANS used throughout the application. */
 #include "ax25_pad.h"		/* for AX25_MAX_ADDR_LEN */
 
@@ -25,7 +29,9 @@ enum ptt_method_e {
 	PTT_METHOD_NONE,	/* VOX or no transmit. */
 	PTT_METHOD_SERIAL,	/* Serial port RTS or DTR. */
 	PTT_METHOD_GPIO,	/* General purpose I/O, Linux only. */
-	PTT_METHOD_LPT };	/* Parallel printer port, Linux only. */
+	PTT_METHOD_LPT,	    	/* Parallel printer port, Linux only. */
+	PTT_METHOD_HAMLIB, 	/* HAMLib, Linux only. */
+	PTT_METHOD_CM108 };	/* GPIO pin of CM108/CM119/etc.  Linux only. */
 
 typedef enum ptt_method_e ptt_method_t;
 
@@ -41,19 +47,12 @@ enum audio_in_type_e {
 
 typedef enum retry_e {
 		RETRY_NONE=0,
-		RETRY_SWAP_SINGLE=1,
-		RETRY_SWAP_DOUBLE=2,
-		RETRY_SWAP_TRIPLE=3,
-		RETRY_REMOVE_SINGLE=4,
-		RETRY_REMOVE_DOUBLE=5,
-		RETRY_REMOVE_TRIPLE=6,
-		RETRY_INSERT_SINGLE=7,
-		RETRY_INSERT_DOUBLE=8,
-		RETRY_SWAP_TWO_SEP=9,
-		RETRY_SWAP_MANY=10,
-		RETRY_REMOVE_MANY=11,
-		RETRY_REMOVE_TWO_SEP=12,
-		RETRY_MAX = 13}  retry_t;
+		RETRY_INVERT_SINGLE=1,
+		RETRY_INVERT_DOUBLE=2,
+		RETRY_INVERT_TRIPLE=3,
+		RETRY_INVERT_TWO_SEP=4,
+		RETRY_MAX = 5}  retry_t;
+
 
 typedef enum sanity_e { SANITY_APRS, SANITY_AX25, SANITY_NONE } sanity_t;
 			 
@@ -87,6 +86,21 @@ struct audio_s {
 
 	char tts_script[80];		/* Script for text to speech. */
 
+	int statistics_interval;	/* Number of seconds between the audio */
+					/* statistics reports.  This is set by */
+					/* the "-a" option.  0 to disable feature. */
+
+	int xmit_error_rate;		/* For testing purposes, we can generate frames with an invalid CRC */
+					/* to simulate corruption while going over the air. */
+					/* This is the probability, in per cent, of randomly corrupting it. */
+					/* Normally this is 0.  25 would mean corrupt it 25% of the time. */
+
+	int recv_error_rate;		/* Similar but the % probablity of dropping a received frame. */
+
+	char timestamp_format[40];	/* -T option */
+					/* Precede received & transmitted frames with timestamp. */
+					/* Command line option uses "strftime" format string. */
+
 
 	/* Properties for each audio channel, common to receive and transmit. */
 	/* Can be different for each radio channel. */
@@ -100,11 +114,12 @@ struct audio_s {
                                 	/* Could all be the same or different. */
 
 
-	    enum modem_t { MODEM_AFSK, MODEM_BASEBAND, MODEM_SCRAMBLE, MODEM_OFF } modem_type;
+	    enum modem_t { MODEM_AFSK, MODEM_BASEBAND, MODEM_SCRAMBLE, MODEM_QPSK, MODEM_8PSK, MODEM_OFF } modem_type;
 
 					/* Usual AFSK. */
 					/* Baseband signal. Not used yet. */
 					/* Scrambled http://www.amsat.org/amsat/articles/g3ruh/109/fig03.gif */
+					/* Might try MFJ-2400 / CCITT v.26 / Bell 201 someday. */
 					/* No modem.  Might want this for DTMF only channel. */
 
 
@@ -123,11 +138,15 @@ struct audio_s {
 	    int decimate;		/* Reduce AFSK sample rate by this factor to */
 					/* decrease computational requirements. */
 
+	    int interleave;		/* If > 1, interleave samples among multiple decoders. */
+					/* Quick hack for experiment. */
+
             int mark_freq;		/* Two tones for AFSK modulation, in Hz. */
 	    int space_freq;		/* Standard tones are 1200 and 2200 for 1200 baud. */
 
-	    int baud;			/* Data bits (more accurately, symbols) per second. */
+	    int baud;			/* Data bits per second. */
 					/* Standard rates are 1200 for VHF and 300 for HF. */
+					/* This should really be called bits per second. */
 
 	/* Next 3 come from config file or command line. */
 
@@ -137,19 +156,13 @@ struct audio_s {
 
 	    int offset;			/* Spacing between filter frequencies. */
 
-	/* Next two are derived from 3 above by demod_init. */
+	    int num_slicers;		/* Number of different threshold points to decide */
+					/* between mark or space. */
 
-	    int num_demod;		/* Number of different demodulators (filters). */
-					/* Previously this was same as num_subchan but we add */
-					/* a new variation in version 1.2 where a single modem */
-					/* can feed multiple slicers and HDLC decoders. */
+	/* This is derived from above by demod_init. */
 
-					/* num_slicers could be added to be more general but */
-					/* for the intial experiment, we can just examine profiles. */
+	    int num_subchan;		/* Total number of modems for each channel. */
 
-	    int num_subchan;		/* Total number of modems / hdlc decoders for each channel. */
-					/* Potentially it could be product of strlen(profiles) * num_freq. */
-					/* Currently can't use both at once. */
 
 	/* These are for dealing with imperfect frames. */
 
@@ -166,37 +179,89 @@ struct audio_s {
 	    int passall;		/* Allow thru even with bad CRC. */
 
 
+
 	/* Additional properties for transmit. */
 	
 	/* Originally we had control outputs only for PTT. */
 	/* In version 1.2, we generalize this to allow others such as DCD. */
+	/* In version 1.4 we add CON for connected to another station. */
 	/* Index following structure by one of these: */
 
 
 #define OCTYPE_PTT 0
 #define OCTYPE_DCD 1
-#define OCTYPE_FUTURE 2	
+#define OCTYPE_CON 2
 
-#define NUM_OCTYPES 3		/* number of values above */
+#define NUM_OCTYPES 3		/* number of values above.   i.e. last value +1. */
 	
 	    struct {  		
 
-	        ptt_method_t ptt_method; /* none, serial port, GPIO, LPT. */
+	        ptt_method_t ptt_method; /* none, serial port, GPIO, LPT, HAMLIB, CM108. */
 
-	        char ptt_device[20];	/* Serial device name for PTT.  e.g. COM1 or /dev/ttyS0 */
+	        char ptt_device[100];	/* Serial device name for PTT.  e.g. COM1 or /dev/ttyS0 */
+					/* Also used for HAMLIB.  Could be host:port when model is 1. */
+					/* For years, 20 characters was plenty then we start getting extreme names like this: */
+					/* /dev/serial/by-id/usb-FTDI_Navigator__CAT___2nd_PTT__00000000-if00-port0 */
+					/* /dev/serial/by-id/usb-Prolific_Technology_Inc._USB-Serial_Controller_D-if00-port0 */
+					/* Issue 104, changed to 100 bytes in version 1.5. */
+
+					/* This same field is also used for CM108 GPIO PTT which will */
+					/* have a name like /dev/hidraw1. */
 			
 	        ptt_line_t ptt_line;	/* Control line when using serial port. PTT_LINE_RTS, PTT_LINE_DTR. */
 	        ptt_line_t ptt_line2;	/* Optional second one:  PTT_LINE_NONE when not used. */
 
-	        int ptt_gpio;		/* GPIO number. */
-	
+	        int out_gpio_num;	/* GPIO number.  Originally this was only for PTT. */
+					/* It is now more general. */
+					/* octrl array is indexed by PTT, DCD, or CONnected indicator. */
+					/* For CM108, this should be in range of 1-8. */
+
+#define MAX_GPIO_NAME_LEN 20	// 12 would cover any case I've seen so this should be safe
+
+		char out_gpio_name[MAX_GPIO_NAME_LEN];
+					/* orginally, gpio number NN was assumed to simply */
+					/* have the name gpioNN but this turned out not to be */
+					/* the case for CubieBoard where it was longer. */
+					/* This is filled in by ptt_init so we don't have to */
+					/* recalculate it each time we access it. */
+
+					/* This could probably be collapsed into ptt_device instead of being separate. */
+
 	        int ptt_lpt_bit;	/* Bit number for parallel printer port.  */
 					/* Bit 0 = pin 2, ..., bit 7 = pin 9. */
 
 	        int ptt_invert;		/* Invert the output. */
 	        int ptt_invert2;	/* Invert the secondary output. */
 
+#ifdef USE_HAMLIB
+
+	        int ptt_model;		/* HAMLIB model.  -1 for AUTO.  2 for rigctld.  Others are radio model. */
+#endif
+
 	    } octrl[NUM_OCTYPES];
+
+
+	/* Each channel can also have associated input lines. */
+	/* So far, we just have one for transmit inhibit. */
+
+#define ICTYPE_TXINH 0
+
+#define NUM_ICTYPES 1		/* number of values above. i.e. last value +1. */
+
+	    struct {
+		ptt_method_t method;	/* none, serial port, GPIO, LPT. */
+
+		int in_gpio_num;	/* GPIO number */
+
+		char in_gpio_name[MAX_GPIO_NAME_LEN];
+					/* orginally, gpio number NN was assumed to simply */
+					/* have the name gpioNN but this turned out not to be */
+					/* the case for CubieBoard where it was longer. */
+					/* This is filled in by ptt_init so we don't have to */
+					/* recalculate it each time we access it. */
+
+		int invert;		/* 1 = active low */
+	    } ictrl[NUM_ICTYPES];
 
 	/* Transmit timing. */
 
@@ -220,14 +285,22 @@ struct audio_s {
 					/* are done sending the data.  This is to avoid */
 					/* dropping PTT too soon and chopping off the end */
 					/* of the frame.  Again 10 mS units. */
-					/* At this point, I'm thinking of 10 as the default. */
+					/* At this point, I'm thinking of 10 (= 100 mS) as the default */
+					/* because we're not quite sure when the soundcard audio stops. */
+
+	    int fulldup;		/* Full Duplex. */
 
 	} achan[MAX_CHANS];
+
+#ifdef USE_HAMLIB
+    int rigs;               /* Total number of configured rigs */
+    RIG *rig[MAX_RIGS];     /* HAMLib rig instances */
+#endif
 
 };
 
 
-#if __WIN32__
+#if __WIN32__ || __APPLE__
 #define DEFAULT_ADEVICE	""		/* Windows: Empty string = default audio device. */
 #else
 #if USE_ALSA
@@ -259,12 +332,16 @@ struct audio_s {
 					/* 44100 works a little better than 22050. */
 					/* If you have a reasonable machine, use the highest rate. */
 #define MIN_SAMPLES_PER_SEC	8000
-#define MAX_SAMPLES_PER_SEC	48000	/* Formerly 44100. */
-					/* Software defined radio often uses 48000. */
+//#define MAX_SAMPLES_PER_SEC	48000	/* Originally 44100.  Later increased because */
+					/* Software Defined Radio often uses 48000. */
+
+#define MAX_SAMPLES_PER_SEC	192000	/* The cheap USB-audio adapters (e.g. CM108) can handle 44100 and 48000. */
+					/* The "soundcard" in my desktop PC can do 96kHz or even 192kHz. */
+					/* We will probably need to increase the sample rate to go much above 9600 baud. */
 
 #define DEFAULT_BITS_PER_SAMPLE	16
 
-#define DEFAULT_FIX_BITS RETRY_SWAP_SINGLE
+#define DEFAULT_FIX_BITS RETRY_INVERT_SINGLE
 
 /* 
  * Standard for AFSK on VHF FM. 
@@ -281,7 +358,13 @@ struct audio_s {
 #define DEFAULT_SPACE_FREQ	2200
 #define DEFAULT_BAUD		1200
 
+/* Used for sanity checking in config file and command line options. */
+/* 9600 baud is known to work.  */
+/* TODO: Is 19200 possible with a soundcard at 44100 samples/sec or do we need a higher sample rate? */
 
+#define MIN_BAUD		100
+//#define MAX_BAUD		10000
+#define MAX_BAUD		40000		// Anyone want to try 38.4 k baud?
 
 /*
  * Typical transmit timings for VHF.
@@ -292,13 +375,12 @@ struct audio_s {
 #define DEFAULT_PERSIST		63
 #define DEFAULT_TXDELAY		30
 #define DEFAULT_TXTAIL		10	
-
+#define DEFAULT_FULLDUP		0
 
 /* 
  * Note that we have two versions of these in audio.c and audio_win.c.
  * Use one or the other depending on the platform.
  */
-
 
 int audio_open (struct audio_s *pa);
 

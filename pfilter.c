@@ -1,7 +1,7 @@
 //
 //    This file is part of Dire Wolf, an amateur radio packet TNC.
 //
-//    Copyright (C) 2015  John Langner, WB2OSZ
+//    Copyright (C) 2015, 2016  John Langner, WB2OSZ
 //
 //    This program is free software: you can redistribute it and/or modify
 //    it under the terms of the GNU General Public License as published by
@@ -37,6 +37,7 @@
  *
  *---------------------------------------------------------------*/
 
+#include "direwolf.h"
 
 #include <unistd.h>
 #include <assert.h>
@@ -45,16 +46,48 @@
 #include <stdio.h>
 #include <ctype.h>
 
-#if __WIN32__
-char *strsep(char **stringp, const char *delim);
-#endif
-
-#include "direwolf.h"
 #include "ax25_pad.h"
 #include "textcolor.h"
 #include "decode_aprs.h"
 #include "latlong.h"
 #include "pfilter.h"
+#include "mheard.h"
+
+
+
+/*
+ * Global stuff (to this file)
+ *
+ * These are set by init function.
+ */
+
+static struct igate_config_s	*save_igate_config_p;
+static int 			s_debug = 0;
+
+
+
+/*-------------------------------------------------------------------
+ *
+ * Name:        pfilter_init
+ *
+ * Purpose:     One time initialization when main application starts up.
+ *
+ * Inputs:	p_igate_config	- IGate configuration.
+ *  
+ *		debug_level	- 0	no debug output.
+ *				  1	single summary line with final result. Indent by 1.
+ *				  2	details from each filter specification.  Indent by 3.
+ *				  3	Logical operators.  Indent by 2.
+ *
+ *--------------------------------------------------------------------*/
+
+
+void pfilter_init (struct igate_config_s *p_igate_config, int debug_level)
+{
+	s_debug = debug_level;
+	save_igate_config_p = p_igate_config;
+}
+
 
 
 
@@ -69,9 +102,6 @@ typedef struct pfstate_s {
 	int from_chan;				/* From and to channels.   MAX_CHANS is used for IGate. */
 	int to_chan;				/* Used only for debug and error messages. */
 
-
-// TODO: might want to put channels and packet here so we only pass one thing around.
-
 /*
  * Original filter string from config file.
  * All control characters should be replaced by spaces.
@@ -85,9 +115,15 @@ typedef struct pfstate_s {
 	packet_t pp;
 
 /*
- * Packet split into separate parts.
+ * Are we processing APRS or connected mode?
+ * This determines whch types of filters are available.
+ */
+	int is_aprs;
+
+/*
+ * Packet split into separate parts if APRS.
  * Most interesting fields are:
- *		g_src		- source address
+ *
  *		g_symbol_table	- / \ or overlay
  *		g_symbol_code
  *		g_lat, g_lon	- Location
@@ -118,8 +154,17 @@ static void print_error (pfstate_t *pf, char *msg);
 
 static int filt_bodgu (pfstate_t *pf, char *pattern);
 static int filt_t (pfstate_t *pf);
-static int filt_r (pfstate_t *pf);
+static int filt_r (pfstate_t *pf, char *sdist);
 static int filt_s (pfstate_t *pf);
+static int filt_i (pfstate_t *pf);
+
+static char *bool2text (int val)
+{
+	if (val == 1) return "TRUE";
+	if (val == 0) return "FALSE";
+	if (val == -1) return "ERROR";
+	return "OOPS!";
+}
 
 
 /*-------------------------------------------------------------------
@@ -133,9 +178,13 @@ static int filt_s (pfstate_t *pf);
  *				Both are 0 .. MAX_CHANS-1 or MAX_CHANS for IGate.  
  *			 	For debug/error messages only.
  *
- *		filter	- Filter specs and logical operators to combine them.
+ *		filter	- String of filter specs and logical operators to combine them.
  *
  *		pp	- Packet object handle.
+ *
+ *		is_aprs	- True for APRS, false for connected mode digipeater.
+ *			  Connected mode allows a subset of the filter types, only
+ *			  looking at the addresses, not information part contents.
  *
  * Returns:	 1 = yes
  *		 0 = no
@@ -146,18 +195,35 @@ static int filt_s (pfstate_t *pf);
  *
  *--------------------------------------------------------------------*/
 
-int pfilter (int from_chan, int to_chan, char *filter, packet_t pp)
+int pfilter (int from_chan, int to_chan, char *filter, packet_t pp, int is_aprs)
 {
 	pfstate_t pfstate;
 	char *p;
 	int result;
 
+	assert (from_chan >= 0 && from_chan <= MAX_CHANS);
+	assert (to_chan >= 0 && to_chan <= MAX_CHANS);
+
+	memset (&pfstate, 0, sizeof(pfstate));
+
+	if (pp == NULL) {
+	  text_color_set(DW_COLOR_ERROR);
+	  dw_printf ("INTERNAL ERROR in pfilter: NULL packet pointer. Please report this!\n");
+	  return (-1);
+	}
+	if (filter == NULL) {
+	  text_color_set(DW_COLOR_ERROR);
+	  dw_printf ("INTERNAL ERROR in pfilter: NULL filter string pointer. Please report this!\n");
+	  return (-1);
+	}
+
 	pfstate.from_chan = from_chan;
 	pfstate.to_chan = to_chan;
 
-	/* Copy filter string, removing any control characters. */
-	strncpy (pfstate.filter_str, filter, MAX_FILTER_LEN-1);
-	pfstate.filter_str[MAX_FILTER_LEN-1] = '\0';
+	/* Copy filter string, changing any control characers to spaces. */
+
+	strlcpy (pfstate.filter_str, filter, sizeof(pfstate.filter_str));
+
 	pfstate.nexti = 0;
 	for (p = pfstate.filter_str; *p != '\0'; p++) {
 	  if (iscntrl(*p)) {
@@ -166,7 +232,11 @@ int pfilter (int from_chan, int to_chan, char *filter, packet_t pp)
 	}
 
 	pfstate.pp = pp;
-	decode_aprs (&pfstate.decoded, pp, 1);	
+	pfstate.is_aprs = is_aprs;
+
+	if (is_aprs) {
+	  decode_aprs (&pfstate.decoded, pp, 1);
+	}
 
 	next_token(&pfstate);
 	
@@ -185,6 +255,23 @@ int pfilter (int from_chan, int to_chan, char *filter, packet_t pp)
 	    result = -1;
 	  }
 	}
+
+	if (s_debug >= 1) {
+	  text_color_set(DW_COLOR_DEBUG);
+	  if (from_chan == MAX_CHANS) {
+	    dw_printf (" Packet filter from IGate to radio channel %d returns %s\n", to_chan, bool2text(result));
+	  }
+	  else if (to_chan == MAX_CHANS) {
+	    dw_printf (" Packet filter from radio channel %d to IGate returns %s\n", from_chan, bool2text(result));
+	  }
+	  else if (is_aprs) {
+	    dw_printf (" Packet filter for APRS digipeater from radio channel %d to %d returns %s\n", from_chan, to_chan, bool2text(result));
+	  }
+	  else {
+	    dw_printf (" Packet filter for traditional digipeater from radio channel %d to %d returns %s\n", from_chan, to_chan, bool2text(result));
+	  }
+	}
+
 	return (result);
 
 } /* end pfilter */
@@ -206,11 +293,11 @@ int pfilter (int from_chan, int to_chan, char *filter, packet_t pp)
  *		Note that a filter-spec must be followed by space or 
  *		end of line.  This is so the magic characters can appear in one.
  *
- * Future:	Allow words like 'OR' as alternatives to symbols like '|'.
+ * Future:	Maybe allow words like 'OR' as alternatives to symbols like '|'.
  *
  * Unresolved Issue:
  *
- *		Adding the special operattors adds a new complication.
+ *		Adding the special operators adds a new complication.
  *		How do we handle the case where we want those characters in
  *		a filter specification?   For example how do we know if the
  *		last character of /#& means HF gateway or AND the next part
@@ -242,32 +329,32 @@ static void next_token (pfstate_t *pf)
 
 	if (pf->filter_str[pf->nexti] == '\0') {
 	  pf->token_type = TOKEN_EOL;
-	  strcpy (pf->token_str, "end-of-line");
+	  strlcpy (pf->token_str, "end-of-line", sizeof(pf->token_str));
 	}
 	else if (pf->filter_str[pf->nexti] == '&') {
 	  pf->nexti++;
 	  pf->token_type = TOKEN_AND;
-	  strcpy (pf->token_str, "\"&\"");
+	  strlcpy (pf->token_str, "\"&\"", sizeof(pf->token_str));
 	}
 	else if (pf->filter_str[pf->nexti] == '|') {
 	  pf->nexti++;
 	  pf->token_type = TOKEN_OR;
-	  strcpy (pf->token_str, "\"|\"");
+	  strlcpy (pf->token_str, "\"|\"", sizeof(pf->token_str));
 	}
 	else if (pf->filter_str[pf->nexti] == '!') {
 	  pf->nexti++;
 	  pf->token_type = TOKEN_NOT;
-	  strcpy (pf->token_str, "\"!\"");
+	  strlcpy (pf->token_str, "\"!\"", sizeof(pf->token_str));
 	}
 	else if (pf->filter_str[pf->nexti] == '(') {
 	  pf->nexti++;
 	  pf->token_type = TOKEN_LPAREN;
-	  strcpy (pf->token_str, "\"(\"");
+	  strlcpy (pf->token_str, "\"(\"", sizeof(pf->token_str));
 	}
 	else if (pf->filter_str[pf->nexti] == ')') {
 	  pf->nexti++;
 	  pf->token_type = TOKEN_RPAREN;
-	  strcpy (pf->token_str, "\")\"");
+	  strlcpy (pf->token_str, "\")\"", sizeof(pf->token_str));
 	}
 	else {
 	  char *p = pf->token_str;
@@ -323,6 +410,12 @@ static int parse_or_expr (pfstate_t *pf)
 
 	  next_token (pf);
 	  e = parse_and_expr (pf);
+
+	  if (s_debug >= 3) {
+	    text_color_set(DW_COLOR_DEBUG);
+	    dw_printf ("  %s | %s\n", bool2text(result), bool2text(e));
+	  }
+
 	  if (e < 0) return (-1);
 	  result |= e;
 	}
@@ -344,6 +437,12 @@ static int parse_and_expr (pfstate_t *pf)
 
 	  next_token (pf);
 	  e = parse_primary (pf);
+
+	  if (s_debug >= 3) {
+	    text_color_set(DW_COLOR_DEBUG);
+	    dw_printf ("  %s & %s\n", bool2text(result), bool2text(e));
+	  }
+
 	  if (e < 0) return (-1);
 	  result &= e;
 	}
@@ -377,6 +476,12 @@ static int parse_primary (pfstate_t *pf)
 
 	  next_token (pf);
 	  e = parse_primary (pf);
+
+	  if (s_debug >= 3) {
+	    text_color_set(DW_COLOR_DEBUG);
+	    dw_printf ("  ! %s\n", bool2text(e));
+	  }
+
 	  if (e < 0) result = -1;
 	  else result = ! e;
 	}
@@ -403,14 +508,29 @@ static int parse_primary (pfstate_t *pf)
  *		 0 = no
  *		-1 = error detected
  *
+ * Description:	All filter specifications are allowed for APRS.
+ *		Only those dealing with addresses are allowed for connected digipeater.
+ *
+ *		b	- budlist (source)
+ *		d	- digipeaters used
+ *		v	- digipeaters not used
+ *		u	- unproto (destination)
+ *
  *--------------------------------------------------------------------*/
-
-
 
 static int parse_filter_spec (pfstate_t *pf)
 {
 	int result = -1;
-	char addr[AX25_MAX_ADDR_LEN];
+
+
+	if ( ( ! pf->is_aprs) && strchr ("01bdvu", pf->token_str[0]) == NULL) {
+
+	  print_error (pf, "Only b, d, v, and u specifications are allowed for connected mode digipeater filtering.");
+	  result = -1;
+	  next_token (pf);
+	  return (result);
+	}
+
 
 /* undocumented: can use 0 or 1 for testing. */
 
@@ -423,72 +543,205 @@ static int parse_filter_spec (pfstate_t *pf)
 
 /* simple string matching */
 
+/* b - budlist */
+
 	else if (pf->token_str[0] == 'b' && ispunct(pf->token_str[1])) {
 	  /* Budlist - source address */
-	  result = filt_bodgu (pf, pf->decoded.g_src);
+	  char addr[AX25_MAX_ADDR_LEN];
+	  ax25_get_addr_with_ssid (pf->pp, AX25_SOURCE, addr);
+	  result = filt_bodgu (pf, addr);
+
+	  if (s_debug >= 2) {
+	    text_color_set(DW_COLOR_DEBUG);
+	    dw_printf ("   %s returns %s for %s\n", pf->token_str, bool2text(result), addr);
+	  }
 	}
+
+/* o - object or item name */
+
 	else if (pf->token_str[0] == 'o' && ispunct(pf->token_str[1])) {
-	  /* Object or item name */
 	  result = filt_bodgu (pf, pf->decoded.g_name);
+
+	  if (s_debug >= 2) {
+	    text_color_set(DW_COLOR_DEBUG);
+	    dw_printf ("   %s returns %s for %s\n", pf->token_str, bool2text(result), pf->decoded.g_name);
+	  }
 	}
+
+/* d - was digipeated by */
+
 	else if (pf->token_str[0] == 'd' && ispunct(pf->token_str[1])) {
 	  int n;
-	  // loop on used digipeaters
+	  // loop on all digipeaters
 	  result = 0;
 	  for (n = AX25_REPEATER_1; result == 0 && n < ax25_get_num_addr (pf->pp); n++) {
+	    // Consider only those with the H (has-been-used) bit set.
 	    if (ax25_get_h (pf->pp, n)) {
+	      char addr[AX25_MAX_ADDR_LEN];
 	      ax25_get_addr_with_ssid (pf->pp, n, addr);
 	      result = filt_bodgu (pf, addr);
 	    }
 	  }
+
+	  if (s_debug >= 2) {
+	    char path[100];
+
+	    ax25_format_via_path (pf->pp, path, sizeof(path));
+	    if (strlen(path) == 0) {
+	      strcpy (path, "no digipeater path");
+	    }
+	    text_color_set(DW_COLOR_DEBUG);
+	    dw_printf ("   %s returns %s for %s\n", pf->token_str, bool2text(result), path);
+	  }
 	}
+
+/* v - via not used */
+
+	else if (pf->token_str[0] == 'v' && ispunct(pf->token_str[1])) {
+	  int n;
+	  // loop on all digipeaters (mnemonic Via)
+	  result = 0;
+	  for (n = AX25_REPEATER_1; result == 0 && n < ax25_get_num_addr (pf->pp); n++) {
+	    // This is different than the previous "d" filter.
+	    // Consider only those where the the H (has-been-used) bit is NOT set.
+	    if ( ! ax25_get_h (pf->pp, n)) {
+	      char addr[AX25_MAX_ADDR_LEN];
+	      ax25_get_addr_with_ssid (pf->pp, n, addr);
+	      result = filt_bodgu (pf, addr);
+	    }
+	  }
+
+	  if (s_debug >= 2) {
+	    char path[100];
+
+	    ax25_format_via_path (pf->pp, path, sizeof(path));
+	    if (strlen(path) == 0) {
+	      strcpy (path, "no digipeater path");
+	    }
+	    text_color_set(DW_COLOR_DEBUG);
+	    dw_printf ("   %s returns %s for %s\n", pf->token_str, bool2text(result), path);
+	  }
+	}
+
+/* g - Addressee of message. */
+
 	else if (pf->token_str[0] == 'g' && ispunct(pf->token_str[1])) {
-	  /* Addressee of message. */
 	  if (ax25_get_dti(pf->pp) == ':') {
 	    result = filt_bodgu (pf, pf->decoded.g_addressee);
+
+	    if (s_debug >= 2) {
+	      text_color_set(DW_COLOR_DEBUG);
+	      dw_printf ("   %s returns %s for %s\n", pf->token_str, bool2text(result), pf->decoded.g_addressee);
+	    }
 	  }
 	  else {
 	    result = 0;
+	    if (s_debug >= 2) {
+	      text_color_set(DW_COLOR_DEBUG);
+	      dw_printf ("   %s returns %s for %s\n", pf->token_str, bool2text(result), "not a message");
+	    }
 	  }
 	}
+
+/* u - unproto (destination) */
+
 	else if (pf->token_str[0] == 'u' && ispunct(pf->token_str[1])) {
-	  /* Unproto (destination) - probably want to exclude mic-e types */
-	  /* because destintation is used for part of location. */
+	  /* Probably want to exclude mic-e types */
+	  /* because destination is used for part of location. */
 
 	  if (ax25_get_dti(pf->pp) != '\'' && ax25_get_dti(pf->pp) != '`') {
+	    char addr[AX25_MAX_ADDR_LEN];
 	    ax25_get_addr_with_ssid (pf->pp, AX25_DESTINATION, addr);
 	    result = filt_bodgu (pf, addr);
+
+	    if (s_debug >= 2) {
+	      text_color_set(DW_COLOR_DEBUG);
+	      dw_printf ("   %s returns %s for %s\n", pf->token_str, bool2text(result), addr);
+	    }
 	  }
 	  else {
 	    result = 0;
+	    if (s_debug >= 2) {
+	      text_color_set(DW_COLOR_DEBUG);
+	      dw_printf ("   %s returns %s for %s\n", pf->token_str, bool2text(result), "MIC-E packet type");
+	    }
 	  }
 	}
 
-/* type: position, weather, etc. */
+/* t - type: position, weather, etc. */
 
 	else if (pf->token_str[0] == 't' && ispunct(pf->token_str[1])) {
 	  
-	  ax25_get_addr_with_ssid (pf->pp, AX25_DESTINATION, addr);
 	  result = filt_t (pf);
+
+	  if (s_debug >= 2) {
+	    char *infop = NULL;
+	    (void) ax25_get_info (pf->pp, (unsigned char **)(&infop));
+
+	    text_color_set(DW_COLOR_DEBUG);
+	    dw_printf ("   %s returns %s for %c data type indicator\n", pf->token_str, bool2text(result), *infop);
+	  }
 	}
 
-/* range */
+/* r - range */
 
 	else if (pf->token_str[0] == 'r' && ispunct(pf->token_str[1])) {
 	  /* range */
-	  result = filt_r (pf);
+	  char sdist[30];
+	  strcpy (sdist, "unknown distance");
+	  result = filt_r (pf, sdist);
+
+	  if (s_debug >= 2) {
+	    text_color_set(DW_COLOR_DEBUG);
+	    dw_printf ("   %s returns %s for %s\n", pf->token_str, bool2text(result), sdist);
+	  }
 	}
 
-/* symbol */
+/* s - symbol */
 
 	else if (pf->token_str[0] == 's' && ispunct(pf->token_str[1])) {
 	  /* symbol */
 	  result = filt_s (pf);
+
+	  if (s_debug >= 2) {
+	    text_color_set(DW_COLOR_DEBUG);
+	    if (pf->decoded.g_symbol_table == '/') {
+	      dw_printf ("   %s returns %s for symbol %c in primary table\n", pf->token_str, bool2text(result), pf->decoded.g_symbol_code);
+	    }
+	    else if (pf->decoded.g_symbol_table == '\\') {
+	      dw_printf ("   %s returns %s for symbol %c in alternate table\n", pf->token_str, bool2text(result), pf->decoded.g_symbol_code);
+	    }
+	    else {
+	      dw_printf ("   %s returns %s for symbol %c with overlay %c\n", pf->token_str, bool2text(result), pf->decoded.g_symbol_code, pf->decoded.g_symbol_table);
+	    }
+	  }
 	}
+
+/* i - IGate messaging default */
+
+	else if (pf->token_str[0] == 'i' && ispunct(pf->token_str[1])) {
+	  /* IGatge messaging */
+	  result = filt_i (pf);
+
+	  if (s_debug >= 2) {
+	    char *infop = NULL;
+	    (void) ax25_get_info (pf->pp, (unsigned char **)(&infop));
+
+	    text_color_set(DW_COLOR_DEBUG);
+	    if (*infop == ':' && ! is_telem_metadata(infop)) {
+	      dw_printf ("   %s returns %s for message to %s\n", pf->token_str, bool2text(result), pf->decoded.g_addressee);
+	    }
+	    else {
+	      dw_printf ("   %s returns %s for not an APRS 'message'\n", pf->token_str, bool2text(result));
+	    }
+	  }
+	}
+
+/* unrecognized filter type */
 
 	else  {
 	  char stemp[80];
-	  sprintf (stemp, "Unrecognized filter type '%c'", pf->token_str[0]);
+	  snprintf (stemp, sizeof(stemp), "Unrecognized filter type '%c'", pf->token_str[0]);
 	  print_error (pf, stemp);
 	  result = -1;
 	}
@@ -512,7 +765,8 @@ static int parse_filter_spec (pfstate_t *pf)
  * 				Object		o/obj1/obj2...  
  * 				Digipeater	d/digi1/digi2...  
  * 				Group Msg	g/call1/call2...  
- * 				Unproto		u/unproto1/unproto2...  
+ * 				Unproto		u/unproto1/unproto2...
+ *				Via-not-yet	v/digi1/digi2...noteapd
  *
  *		arg	- Value to match from source addr, destination,
  *			  used digipeater, object name, etc.
@@ -535,7 +789,7 @@ static int filt_bodgu (pfstate_t *pf, char *arg)
 	char *v;
 	int result = 0;
 
-	strcpy (str, pf->token_str);
+	strlcpy (str, pf->token_str, sizeof(str));
 	sep[0] = str[1];
 	sep[1] = '\0';
 	cp = str + 2;
@@ -549,7 +803,7 @@ static int filt_bodgu (pfstate_t *pf, char *arg)
 	    /* Wildcarding.  Should have single * on end. */
 
 	    mlen = w - v;
-	    if (mlen != strlen(v) - 1) {
+	    if (mlen != (int)(strlen(v) - 1)) {
 	      print_error (pf, "Any wildcard * must be at the end of pattern.\n");
 	      return (-1);
 	    }
@@ -588,25 +842,47 @@ static int filt_bodgu (pfstate_t *pf, char *arg)
  *		
  *------------------------------------------------------------------------------*/
 
+/* Telemetry metadata is a special case of message. */
+/* We want to categorize it as telemetry rather than message. */
+
+int is_telem_metadata (char *infop)
+{
+	if (*infop != ':') return (0);
+	if (strlen(infop) < 16) return (0);
+	if (strncmp(infop+10, ":PARM.", 6) == 0) return (1);
+	if (strncmp(infop+10, ":UNIT.", 6) == 0) return (1);
+	if (strncmp(infop+10, ":EQNS.", 6) == 0) return (1);
+	if (strncmp(infop+10, ":BITS.", 6) == 0) return (1);
+	return (0);
+}
+
+
 static int filt_t (pfstate_t *pf) 
 {
-	char src[MAX_TOKEN_LEN];
-	char *infop;
+	char src[AX25_MAX_ADDR_LEN];
+	char *infop = NULL;
 	char *f;
 
+	memset (src, 0, sizeof(src));
 	ax25_get_addr_with_ssid (pf->pp, AX25_SOURCE, src);
 	(void) ax25_get_info (pf->pp, (unsigned char **)(&infop));
+
+	assert (infop != NULL);
 
 	for (f = pf->token_str + 2; *f != '\0'; f++) {
 	  switch (*f) {
 	
 	    case 'p':				/* Position */
 	      if (*infop == '!') return (1);
-	      if (*infop == '\'') return (1);
 	      if (*infop == '/') return (1);
 	      if (*infop == '=') return (1);
 	      if (*infop == '@') return (1);
-	      if (*infop == '`') return (1);
+	      if (*infop == '\'') return (1);	// MIC-E
+	      if (*infop == '`') return (1);	// MIC-E
+
+	      // What if we have "_" symbol code for weather?
+	      // Still consider as position.
+	      // The same packet can match more than one type here.
 	      break;
 
 	    case 'o':				/* Object */
@@ -618,11 +894,16 @@ static int filt_t (pfstate_t *pf)
 	      break;
 
 	    case 'm':				/* Message */
-	      if (*infop == ':') return (1);
+	      if (*infop == ':' && ! is_telem_metadata(infop)) return (1);
 	      break;
 
 	    case 'q':				/* Query */
 	      if (*infop == '?') return (1);
+	      break;
+
+	    case 'c':				/* station Capabilities - my extension */
+						/* Most often used for IGate statistics. */
+	      if (*infop == '<') return (1);
 	      break;
 
 	    case 's':				/* Status */
@@ -631,22 +912,39 @@ static int filt_t (pfstate_t *pf)
 
 	    case 't':				/* Telemetry */
 	      if (*infop == 'T') return (1);
+	      if (is_telem_metadata(infop)) return (1);
 	      break;
 
 	    case 'u':				/* User-defined */
 	      if (*infop == '{') return (1);
 	      break;
 
+	    case 'h':				/* third party Header - my extension */
+	      if (*infop == '}') return (1);
+	      break;
+
 	    case 'w':				/* Weather */
-	      if (*infop == '@') return (1);
-	      if (*infop == '*') return (1);
-	      if (*infop == '_') return (1);
+
+	      if (*infop == '*') return (1);			// Peet Bros
+	      if (*infop == '_') return (1);			// Weather report, no position.
+	      if (strncmp(infop, "!!", 2) == 0) return(1);	// Ultimeter 2000.
 
 	      /* '$' is normally raw GPS. Check for special case. */
+
 	      if (strncmp(infop, "$ULTW", 5) == 0) return (1);
 
-	      /* TODO: Positions !=/@ can be weather. */
-	      /* Need to check for _ symbol. */
+	      /* Positions !=/@ with symbol code _ are weather. */
+
+	      if (strchr("!=/@", *infop) != NULL &&
+			pf->decoded.g_symbol_code == '_') return (1);
+
+	      /* Object with _ symbol is also weather.  APRS protocol spec page 66. */
+
+	      if (*infop == ';' &&
+			pf->decoded.g_symbol_code == '_') return (1);
+
+// TODO: need more test cases at end for new weather cases.
+
 	      break;
 
 	    case 'n':				/* NWS format */
@@ -678,6 +976,12 @@ static int filt_t (pfstate_t *pf)
 		  infop[2] == src[1] &&
 		  infop[3] == src[2]) return (1);
 	      break;
+
+	    default:
+
+	      print_error (pf, "Invalid letter in t/ filter.\n");
+	      return (-1);
+	      break;
 	  }
 	}
 	return (0);			/* Didn't match anything.  Reject */
@@ -690,7 +994,7 @@ static int filt_t (pfstate_t *pf)
  *
  * Name:	filt_r
  * 
- * Purpose:	Is it in range of given location.
+ * Purpose:	Is it in range (kilometers) of given location.
  *
  * Inputs:	pf	- Pointer to current state information.	
  *			  token_str should contain something of format:
@@ -701,6 +1005,8 @@ static int filt_t (pfstate_t *pf)
  *
  *				decoded.g_lat & decoded.g_lon
  *
+ * Outputs:	sdist	- Distance as a string for troubleshooting.
+ *
  * Returns:	 1 = yes
  *		 0 = no
  *		-1 = error detected
@@ -709,7 +1015,7 @@ static int filt_t (pfstate_t *pf)
  *
  *------------------------------------------------------------------------------*/
 
-static int filt_r (pfstate_t *pf)
+static int filt_r (pfstate_t *pf, char *sdist)
 {
 	char str[MAX_TOKEN_LEN];
 	char *cp;
@@ -718,7 +1024,7 @@ static int filt_r (pfstate_t *pf)
 	double dlat, dlon, ddist, km;
 
 
-	strcpy (str, pf->token_str);
+	strlcpy (str, pf->token_str, sizeof(str));
 	sep[0] = str[1];
 	sep[1] = '\0';
 	cp = str + 2;
@@ -750,10 +1056,7 @@ static int filt_r (pfstate_t *pf)
 
 	km = ll_distance_km (dlat, dlon, pf->decoded.g_lat, pf->decoded.g_lon);
 
-
-	text_color_set (DW_COLOR_DEBUG);
-
-	dw_printf ("Calculated distance = %.3f km\n", km);
+	sprintf (sdist, "%.2f km", km);
 
 	if (km <= ddist) {
 	  return (1);
@@ -781,15 +1084,51 @@ static int filt_r (pfstate_t *pf)
  *
  * Description:	
  *		  
- *		“pri” is zero or more symbols from the primary symbol set.
- *		“alt” is one or more symbols from the alternate symbol set.
- *		“over” is overlay characters.  Overlays apply only to the alternate symbol set.
+ *		s/pri
+ *		s/pri/alt
+ *		s/pri/alt/
+ *		s/pri/alt/over
+ *
+ *		"pri" is zero or more symbols from the primary symbol set.
+ *			Symbol codes are any printable ASCII character other than | or ~.
+ *			(Zero symbols here would be sensible only if later alt part is specified.)
+ *		"alt" is one or more symbols from the alternate symbol set.
+ *		"over" is overlay characters for the alternate symbol set.
+ *			Only upper case letters, digits, and \ are allowed here.
+ *			If the last part is not specified, any overlay or lack of overlay, is ignored.
+ *			If the last part is specified, only the listed overlays will match.
+ *			An explicit lack of overlay is represented by the \ character.
  *		
  *		Examples:
- *			s/->		Allow house and car from primary symbol table.
- *			s//#		Allow alternate table digipeater, with or without overlay.
- *			s//#/\		Allow alternate table digipeater, only if no overlay.
- *			s//#/SL1	Allow alternate table digipeater, with overlay S, L, or 1
+ *			s/O		Balloon.
+ *			s/->		House or car from primary symbol table.
+ *
+ *			s//#		Alternate table digipeater, with or without overlay.
+ *			s//#/\		Alternate table digipeater, only if no overlay.
+ *			s//#/SL1	Alternate table digipeater, with overlay S, L, or 1.
+ *			s//#/SL\	Alternate table digipeater, with S, L, or no overlay.
+ *
+ *			s/s/s		Any variation of watercraft.  Either symbol table.  With or without overlay.
+ *			s/s/s/		Ship or ship sideview, only if no overlay.
+ *			s//s/J		Jet Ski.
+ *
+ *		What if you want to use the / symbol when / is being used as a delimiter here?  Recall that you
+ *		can use some other special character after the initial lower case letter and this becomes the
+ *		delimiter for the rest of the specification.
+ *
+ *		Examples:
+ *
+ *			s:/		Red Dot.
+ *			s::/		Waypoint Destination, with or without overlay.
+ *			s:/:/		Either Red Dot or Waypoint Destination.
+ *			s:/:/:		Either Red Dot or Waypoint Destination, no overlay.
+ *
+ *		Bad example:
+ *
+ *			Someone tried using this to include ballons:   s/'/O/-/#/_
+ *			probably following the buddy filter pattern of / between each alternative.
+ *			There should be an error message because it has more than 3 delimiter characters.
+ *
  * 
  *------------------------------------------------------------------------------*/
 
@@ -797,57 +1136,348 @@ static int filt_s (pfstate_t *pf)
 {
 	char str[MAX_TOKEN_LEN];
 	char *cp;
-	char sep[2];
-	char *pri, *alt, *over;
+	char sep[2];		// Delimiter character.  Typically / but it could be different.
+	char *pri = NULL, *alt = NULL, *over = NULL, *extra = NULL;
+	char *x;
 
 
-	strcpy (str, pf->token_str);
+	strlcpy (str, pf->token_str, sizeof(str));
 	sep[0] = str[1];
 	sep[1] = '\0';
 	cp = str + 2;
 
+
+// First, separate the parts and do a strict syntax check.
+
 	pri = strsep (&cp, sep);
-	if (pri == NULL) {
+
+	if (pri != NULL) {
+
+	  // Zero length is acceptable if alternate symbol(s) specified.  Will check that later.
+
+	  for (x = pri; *x != '\0'; x++) {
+	    if ( ! isprint(*x) || *x == '|' || *x == '~') {
+	      print_error (pf, "Symbol filter, primary must be printable ASCII character(s) other than | or ~.");
+	      return (-1);
+	    }
+	  }
+
+	  alt = strsep (&cp, sep);
+
+	  if (alt != NULL) {
+
+	    // Zero length after second / would be pointless.
+
+	    if (strlen(alt) == 0) {
+	      print_error (pf, "Nothing specified for alternate symbol table.");
+	      return (-1);
+	    }
+
+	    for (x = alt; *x != '\0'; x++) {
+	      if ( ! isprint(*x) || *x == '|' || *x == '~') {
+	        print_error (pf, "Symbol filter, alternate must be printable ASCII character(s) other than | or ~.");
+	        return (-1);
+	      }
+	    }
+
+	    over = strsep (&cp, sep);
+
+	    if (over != NULL) {
+
+	      // Zero length is acceptable and is not the same as missing.
+
+	      for (x = over; *x != '\0'; x++) {
+	        if ( (! isupper(*x)) && (! isdigit(*x)) && *x != '\\') {
+	          print_error (pf, "Symbol filter, overlay must be upper case letter, digit, or \\.");
+	          return (-1);
+	        }
+	      }
+
+	      extra = strsep (&cp, sep);
+
+	      if (extra != NULL) {
+	        print_error (pf, "More than 3 delimiter characters in Symbol filter.");
+	        return (-1);
+	      }
+	    }
+	  }
+	  else {
+	    // No alt part is OK if at least one primary symbol was specified.
+	    if (strlen(pri) == 0) {
+	      print_error (pf, "No symbols specified for Symbol filter.");
+	      return (-1);
+	    }
+	  }
+	}
+	else {
 	  print_error (pf, "Missing arguments for Symbol filter.");
 	  return (-1);
 	}
 
-	if (pf->decoded.g_symbol_table == '/' && strchr(pri, pf->decoded.g_symbol_code) != NULL) {
-	  /* Found in primary symbols. All done. */
-	  return (1);
-	}
 
-	alt = strsep (&cp, sep);
-	if (alt == NULL) {
+// This applies only for Position, Object, Item.
+// decode_aprs() should set symbol code to space to mean undefined.
+
+	if (pf->decoded.g_symbol_code == ' ') {
 	  return (0);
 	}
-	if (strlen(alt) == 0) {
-	  /* We have s/.../ */
-	  print_error (pf, "Missing alternate symbols for Symbol filter.");
-	  return (-1);
+
+
+// Look for Primary symbols.
+
+	if (pf->decoded.g_symbol_table == '/') {
+	  if (pri != NULL && strlen(pri) > 0) {
+	    return (strchr(pri, pf->decoded.g_symbol_code) != NULL);
+	  }
+	}
+
+	if (alt == NULL) {
+	  return (0);
 	}
 
 	//printf ("alt=\"%s\"  sym='%c'\n", alt, pf->decoded.g_symbol_code);
 
-	if (strchr(alt, pf->decoded.g_symbol_code) == NULL) {
-	  /* Not found in alternate symbols. Reject. */
-	  return (0);
+// Look for Alternate symbols.
+
+	if (strchr(alt, pf->decoded.g_symbol_code) != NULL) {
+
+	  // We have a match but that might not be enough.
+	  // We must see if there was an overlay part specified.
+
+	  if (over != NULL) {
+
+	    if (strlen(over) > 0) {
+
+	      // Non-zero length overlay part was specified.
+	      // Need to match one of them.
+
+	      return (strchr(over, pf->decoded.g_symbol_table) != NULL);
+	    }
+	    else {
+
+	      // Zero length overlay part was specified.
+	      // We must have no overlay, i.e.  table is \.
+
+	      return (pf->decoded.g_symbol_table == '\\');
+	    }
+	  }
+	  else {
+
+	    // No check of overlay part.  Just make sure it is not primary table.
+
+	    return (pf->decoded.g_symbol_table != '/');
+	  }
 	}
 
-	over = strsep (&cp, sep);
-	if (over == NULL) {
-	  /* alternate, with or without overlay. */
-	  return (pf->decoded.g_symbol_table != '/');
+	return (0);
+
+} /* end filt_s */
+
+
+/*------------------------------------------------------------------------------
+ *
+ * Name:	filt_i
+ *
+ * Purpose:	IGate messaging default behavior.
+ *
+ * Inputs:	pf	- Pointer to current state information.
+ *			  token_str should contain something of format:
+ *
+ *				i/time/hops/lat/lon/km
+ *
+ * Returns:	 1 = yes
+ *		 0 = no
+ *		-1 = error detected
+ *
+ * Description: Selection is based on time since last heard on RF, and distance
+ *		in terms of digipeater hops and/or phyiscal location.
+ *
+ *		i/time
+ *		i/time/hops
+ *		i/time/hops/lat/lon/km
+ *
+ *
+ *		"time" is maximum number of minutes since message addressee was last heard.
+ *			This is required.
+ *
+ *		"hops" is maximum number of digpeater hops.  (i.e. 0 for heard directly).
+ * 			If hops is not specified, the maximum transmit digipeater hop count,
+ *			from the IGTXVIA configuration will be used.
+
+ *		The rest is distanced, in kilometers, from given point.
+ *		
+ *		Examples:
+ *			i/60/0		Heard in past 60 minutes directly.
+ *			i/45		Past 45 minutes, default max digi hops.
+ *			i/30/3		Default time, max 3 digi hops.
+ *			i/30/8/42.6/-71.3/50.
+ *
+ *
+ *		It only makes sense to use this for the IS>RF direction.
+ *		The basic idea is that we want to transmit a "message" only if the
+ *		addressee has been heard recently and is not too far away.
+ *
+ *		After passing along a "message" we will also allow the next
+ *		position report from the sender of the "message."
+ *		That is done somewhere else.  We are not concerned with it here.
+ *
+ *------------------------------------------------------------------------------*/
+
+static int filt_i (pfstate_t *pf)
+{
+	char str[MAX_TOKEN_LEN];
+	char *cp;
+	char sep[2];
+	char *v;
+	int heardtime = 30;
+#if PFTEST
+	int maxhops = 2;
+#else
+	int maxhops = save_igate_config_p->max_digi_hops;	// from IGTXVIA config.
+#endif
+	double dlat = G_UNKNOWN;
+	double dlon = G_UNKNOWN;
+	double km = G_UNKNOWN;
+
+
+	char src[AX25_MAX_ADDR_LEN];
+	char *infop = NULL;
+	int info_len;
+	//char *f;
+	//char addressee[AX25_MAX_ADDR_LEN];
+
+
+	strlcpy (str, pf->token_str, sizeof(str));
+	sep[0] = str[1];
+	sep[1] = '\0';
+	cp = str + 2;
+
+// Get parameters or defaults.
+
+	v = strsep (&cp, sep);
+
+	if (v != NULL && strlen(v) > 0) {
+	  heardtime = atoi(v);
+	}
+	else {
+	  print_error (pf, "Missing time limit for IGate message filter.");
+	  return (-1);
 	}
 
-	// printf ("over=\"%s\"  table='%c'\n", over, pf->decoded.g_symbol_table);
+	v = strsep (&cp, sep);
 
-	if (strlen(over) == 0) {
-	  return (pf->decoded.g_symbol_table == '\\');
+	if (v != NULL) {
+	  if (strlen(v) > 0) {
+	    maxhops = atoi(v);
+	  }
+	  else {
+	    print_error (pf, "Missing max digipeater hops for IGate message filter.");
+	    return (-1);
+	  }
+
+	  v = strsep (&cp, sep);
+	  if (v != NULL && strlen(v) > 0) {
+	    dlat = atof(v);
+
+	    v = strsep (&cp, sep);
+	    if (v != NULL && strlen(v) > 0) {
+	      dlon = atof(v);
+	    }
+	    else {
+	      print_error (pf, "Missing longitude for IGate message filter.");
+	      return (-1);
+	    }
+
+	    v = strsep (&cp, sep);
+	    if (v != NULL && strlen(v) > 0) {
+	      km = atof(v);
+	    }
+	    else {
+	      print_error (pf, "Missing distance, in km, for IGate message filter.");
+	      return (-1);
+	    }
+	  }
+
+	  v = strsep (&cp, sep);
+	  if (v != NULL) {
+	    print_error (pf, "Something unexpected after distance for IGate message filter.");
+	    return (-1);
+	  }
 	}
 
-	return (strchr(over, pf->decoded.g_symbol_table) != NULL);
-}
+#if PFTEST
+	text_color_set(DW_COLOR_DEBUG);
+	dw_printf ("debug: IGate message filter, %d minutes, %d hops, %.2f %.2f %.2f km\n",
+		heardtime, maxhops, dlat, dlon, km);
+#endif
+
+
+/*
+ * Get source address and info part.
+ * Addressee has already been extracted into pf->decoded.g_addressee.
+ */
+
+	memset (src, 0, sizeof(src));
+	ax25_get_addr_with_ssid (pf->pp, AX25_SOURCE, src);
+	info_len = ax25_get_info (pf->pp, (unsigned char **)(&infop));
+
+	if (infop == NULL) return (0);
+	if (info_len < 1) return (0);
+
+// Determine packet type.  We are interested only in "message."
+// Telemetry metadata is not considered a message.
+
+	if (*infop != ':') return (0);
+	if (is_telem_metadata(infop)) return (0);
+
+
+#if defined(PFTEST) || defined(DIGITEST)	// TODO: test functionality too, not just syntax.
+
+	(void)dlat;	// Suppress set and not used warning.
+	(void)dlon;
+	(void)km;
+	(void)maxhops;
+	(void)heardtime;
+
+	return (1);
+#else
+
+/*
+ * Condition 1:
+ *	"the receiving station has been heard within range within a predefined time
+ *	 period (range defined as digi hops, distance, or both)."
+ */
+
+	int was_heard = mheard_was_recently_nearby ("addressee", pf->decoded.g_addressee, heardtime, maxhops, dlat, dlon, km);
+
+	if ( ! was_heard) return (0);
+
+/*
+ * Condition 2:
+ *	"the sending station has not been heard via RF within a predefined time period
+ *	 (packets gated from the Internet by other stations are excluded from this test)."
+ *
+ * This is the part I'm not so sure about.
+ * I guess the intention is that if the sender can be heard over RF, then the addressee
+ * might hear the sender without the help of Igate stations.
+ * Suppose the sender was 1 digipeater hop to the west and the addressee was 1 digipeater hop to the east.
+ * I can communicate with each of them with 1 digipeater hop but for them to reach each other, they
+ * might need 3 hops and using that many is generally frowned upon and rare.
+ *
+ * Maybe we could compromise here and say the sender must have been heard directly.
+ * It sent the message currently being processed so we must have heard it very recently, i.e. in
+ * the past minute, rather than the usual 30 or 60 minutes for the addressee.
+ */
+
+	was_heard = mheard_was_recently_nearby ("source", src, 1, 0, G_UNKNOWN, G_UNKNOWN, G_UNKNOWN);
+
+	if (was_heard) return (0);
+
+	return (1);
+
+#endif
+
+} /* end filt_i */
 
 
 /*-------------------------------------------------------------------
@@ -869,19 +1499,19 @@ static void print_error (pfstate_t *pf, char *msg)
 	if (pf->from_chan == MAX_CHANS) {
 
 	  if (pf->to_chan == MAX_CHANS) {
-	    sprintf (intro, "filter[IG,IG]: ");
+	    snprintf (intro, sizeof(intro), "filter[IG,IG]: ");
 	  }
 	  else {
-	    sprintf (intro, "filter[IG,%d]: ", pf->to_chan);
+	    snprintf (intro, sizeof(intro), "filter[IG,%d]: ", pf->to_chan);
 	  }
 	}
 	else {
 
 	  if (pf->to_chan == MAX_CHANS) {
-	    sprintf (intro, "filter[%d,IG]: ", pf->from_chan);
+	    snprintf (intro, sizeof(intro), "filter[%d,IG]: ", pf->from_chan);
 	  }
 	  else {
-	    sprintf (intro, "filter[%d,%d]: ", pf->from_chan, pf->to_chan);
+	    snprintf (intro, sizeof(intro), "filter[%d,%d]: ", pf->from_chan, pf->to_chan);
 	  }
 	}
 
@@ -894,7 +1524,7 @@ static void print_error (pfstate_t *pf, char *msg)
 
 
 
-#if TEST
+#if PFTEST
 
 
 /*-------------------------------------------------------------------
@@ -903,7 +1533,7 @@ static void print_error (pfstate_t *pf, char *msg)
  *    
  * Purpose:     Unit test for packet filtering.
  *
- * Usage:	gcc -Wall -o pftest -DTEST pfilter.c ax25_pad.o textcolor.o fcs_calc.o decode_aprs.o latlong.o symbols.o telemetry.o misc.a regex.a && ./pftest
+ * Usage:	gcc -Wall -o pftest -DPFTEST pfilter.c ax25_pad.o textcolor.o fcs_calc.o decode_aprs.o latlong.o symbols.o telemetry.o tt_text.c misc.a regex.a && ./pftest
  *		
  *
  *--------------------------------------------------------------------*/
@@ -914,6 +1544,9 @@ static void pftest (int test_num, char *filter, char *packet, int expected);
 
 int main ()
 {
+
+	dw_printf ("Quick test for packet filtering.\n");
+	dw_printf ("Some error messages are normal.  Look at the final success/fail message.\n");
 
 	pftest (1, "", "WB2OSZ-5>APDW12,WIDE1-1,WIDE2-1:!4237.14NS07120.83W#PHG7140Chelmsford MA", 0);
 	pftest (2, "0", "WB2OSZ-5>APDW12,WIDE1-1,WIDE2-1:!4237.14NS07120.83W#PHG7140Chelmsford MA", 0);
@@ -990,18 +1623,29 @@ int main ()
 	pftest (112, "t/t", "WM1X>APU25N:@210147z4235.39N/07106.58W_359/000g000t027r000P000p000h89b10234/WX REPORT {UIV32N}<0x0d>", 0);
 	pftest (113, "t/w", "WM1X>APU25N:@210147z4235.39N/07106.58W_359/000g000t027r000P000p000h89b10234/WX REPORT {UIV32N}<0x0d>", 1);
 
+	/* Telemetry metadata is a special case of message. */
+	pftest (114, "t/t", "KJ4SNT>APMI04::KJ4SNT   :PARM.Vin,Rx1h,Dg1h,Eff1h,Rx10m,O1,O2,O3,O4,I1,I2,I3,I4", 1);
+	pftest (115, "t/m", "KJ4SNT>APMI04::KJ4SNT   :PARM.Vin,Rx1h,Dg1h,Eff1h,Rx10m,O1,O2,O3,O4,I1,I2,I3,I4", 0);
+	pftest (116, "t/t", "KB1GKN-10>APRX27,UNCAN,WIDE1*:T#491,4.9,0.3,25.0,0.0,1.0,00000000", 1);
+
+
 	pftest (120, "t/p", "CWAPID>APRS::NWS-TTTTT:DDHHMMz,ADVISETYPE,zcs{seq#", 0);
 	pftest (122, "t/p", "CWAPID>APRS::SKYCWA   :DDHHMMz,ADVISETYPE,zcs{seq#", 0);
 	pftest (123, "t/p", "CWAPID>APRS:;CWAttttz *DDHHMMzLATLONICONADVISETYPE{seq#", 0);
 	pftest (124, "t/n", "CWAPID>APRS::NWS-TTTTT:DDHHMMz,ADVISETYPE,zcs{seq#", 1);
 	pftest (125, "t/n", "CWAPID>APRS::SKYCWA   :DDHHMMz,ADVISETYPE,zcs{seq#", 1);
 	pftest (126, "t/n", "CWAPID>APRS:;CWAttttz *DDHHMMzLATLONICONADVISETYPE{seq#", 1);
-	pftest (127, "t/", "CWAPID>APRS:;CWAttttz *DDHHMMzLATLONICONADVISETYPE{seq#", 0);
+	pftest (127, "t/",  "CWAPID>APRS:;CWAttttz *DDHHMMzLATLONICONADVISETYPE{seq#", 0);
 
-	pftest (130, "r/42.6/-71.3/10", "WB2OSZ-5>APDW12,WIDE1-1,WIDE2-1:!4237.14NS07120.83W#PHG7140Chelmsford MA", 1);
-	pftest (131, "r/42.6/-71.3/10", "WA1PLE-5>APWW10,W1MHL,N8VIM,WIDE2*:@022301h4208.75N/07115.16WoAPRS-IS for Win32", 0);
+	pftest (128, "t/c",  "S0RCE>DEST:<stationcapabilities", 1);
+	pftest (129, "t/h",  "S0RCE>DEST:<stationcapabilities", 0);
+	pftest (130, "t/h",  "S0RCE>DEST:}thirdpartyheaderwhatever", 1);
+	pftest (131, "t/c",  "S0RCE>DEST:}thirdpartyheaderwhatever", 0);
 
-	pftest (140, "( t/t & b/WB2OSZ ) | ( t/o & ! r/42.6/-71.3/1 )", "WB2OSZ>APDW12:;home     *111111z4237.14N/07120.83W-Chelmsford MA", 1);
+	pftest (140, "r/42.6/-71.3/10", "WB2OSZ-5>APDW12,WIDE1-1,WIDE2-1:!4237.14NS07120.83W#PHG7140Chelmsford MA", 1);
+	pftest (141, "r/42.6/-71.3/10", "WA1PLE-5>APWW10,W1MHL,N8VIM,WIDE2*:@022301h4208.75N/07115.16WoAPRS-IS for Win32", 0);
+
+	pftest (145, "( t/t & b/WB2OSZ ) | ( t/o & ! r/42.6/-71.3/1 )", "WB2OSZ>APDW12:;home     *111111z4237.14N/07120.83W-Chelmsford MA", 1);
 
 	pftest (150, "s/->", "WB2OSZ-5>APDW12:!4237.14NS07120.83W#PHG7140Chelmsford MA", 0);
 	pftest (151, "s/->", "WB2OSZ-5>APDW12:!4237.14N/07120.83W-PHG7140Chelmsford MA", 1);
@@ -1019,6 +1663,28 @@ int main ()
 	pftest (160, "s//#/LS1", "WB2OSZ-5>APDW12:!4237.14NS07120.83W#PHG7140Chelmsford MA", 1);
 	pftest (161, "s//#/LS1", "WB2OSZ-5>APDW12:!4237.14N\\07120.83W#PHG7140Chelmsford MA", 0);
 	pftest (162, "s//#/LS1", "WB2OSZ-5>APDW12:!4237.14N/07120.83W#PHG7140Chelmsford MA", 0);
+	pftest (163, "s//#/LS\\", "WB2OSZ-5>APDW12:!4237.14N\\07120.83W#PHG7140Chelmsford MA", 1);
+
+	pftest (170, "s:/", "WB2OSZ-5>APDW12:!4237.14N/07120.83W/PHG7140Chelmsford MA", 1);
+	pftest (171, "s:/", "WB2OSZ-5>APDW12:!4237.14N\\07120.83W/PHG7140Chelmsford MA", 0);
+	pftest (172, "s::/", "WB2OSZ-5>APDW12:!4237.14N/07120.83W/PHG7140Chelmsford MA", 0);
+	pftest (173, "s::/", "WB2OSZ-5>APDW12:!4237.14N\\07120.83W/PHG7140Chelmsford MA", 1);
+	pftest (174, "s:/:/", "WB2OSZ-5>APDW12:!4237.14N/07120.83W/PHG7140Chelmsford MA", 1);
+	pftest (175, "s:/:/", "WB2OSZ-5>APDW12:!4237.14N\\07120.83W/PHG7140Chelmsford MA", 1);
+	pftest (176, "s:/:/", "WB2OSZ-5>APDW12:!4237.14NX07120.83W/PHG7140Chelmsford MA", 1);
+	pftest (177, "s:/:/:X", "WB2OSZ-5>APDW12:!4237.14NX07120.83W/PHG7140Chelmsford MA", 1);
+
+	// FIXME: Different on Windows and  64 bit Linux.
+	//pftest (178, "s:/:/:", "WB2OSZ-5>APDW12:!4237.14NX07120.83W/PHG7140Chelmsford MA", 1);
+
+	pftest (179, "s:/:/:\\", "WB2OSZ-5>APDW12:!4237.14NX07120.83W/PHG7140Chelmsford MA", 0);
+
+	pftest (180, "v/DIGI2/DIGI3", "WB2OSZ-5>APDW12,DIGI1,DIGI2,DIGI3,DIGI4:!4237.14NS07120.83W#PHG7140Chelmsford MA", 1);
+	pftest (181, "v/DIGI2/DIGI3", "WB2OSZ-5>APDW12,DIGI1*,DIGI2,DIGI3,DIGI4:!4237.14NS07120.83W#PHG7140Chelmsford MA", 1);
+	pftest (182, "v/DIGI2/DIGI3", "WB2OSZ-5>APDW12,DIGI1,DIGI2*,DIGI3,DIGI4:!4237.14NS07120.83W#PHG7140Chelmsford MA", 1);
+	pftest (183, "v/DIGI2/DIGI3", "WB2OSZ-5>APDW12,DIGI1,DIGI2,DIGI3*,DIGI4:!4237.14NS07120.83W#PHG7140Chelmsford MA", 0);
+	pftest (184, "v/DIGI2/DIGI3", "WB2OSZ-5>APDW12,DIGI1,DIGI2,DIGI3,DIGI4*:!4237.14NS07120.83W#PHG7140Chelmsford MA", 0);
+	pftest (185, "v/DIGI9/DIGI2", "WB2OSZ-5>APDW12,DIGI1,DIGI2*,DIGI3,DIGI4:!4237.14NS07120.83W#PHG7140Chelmsford MA", 0);
 
 	/* Test error reporting. */
 
@@ -1029,15 +1695,41 @@ int main ()
 	pftest (203, "t/w t/w", "CWAPID>APRS:;CWAttttz *DDHHMMzLATLONICONADVISETYPE{seq#", -1);
 	pftest (204, "r/42.6/-71.3", "WA1PLE-5>APWW10,W1MHL,N8VIM,WIDE2*:@022301h4208.75N/07115.16WoAPRS-IS for Win32", -1);
 
+	pftest (220, "i/30/8/42.6/-71.3/50", "WB2OSZ-5>APDW14::W2UB     :Happy Birthday{001", 1);
+	pftest (222, "i/30/8/42.6/-71.3/",   "WB2OSZ-5>APDW14::W2UB     :Happy Birthday{001", -1);
+	pftest (223, "i/30/8/42.6/-71.3",    "WB2OSZ-5>APDW14::W2UB     :Happy Birthday{001", -1);
+	pftest (224, "i/30/8/42.6/",         "WB2OSZ-5>APDW14::W2UB     :Happy Birthday{001", -1);
+	pftest (225, "i/30/8/42.6",          "WB2OSZ-5>APDW14::W2UB     :Happy Birthday{001", -1);
+	pftest (226, "i/30/8/",              "WB2OSZ-5>APDW14::W2UB     :Happy Birthday{001", 1);
+	pftest (227, "i/30/8",               "WB2OSZ-5>APDW14::W2UB     :Happy Birthday{001", 1);
+
+	// FIXME: behaves differently on Windows and Linux.  Why?
+	// On Windows we have our own version of strsep because it's not in the MS library.
+	// It must behave differently than the Linux version when nothing follows the last separator.
+	//pftest (228, "i/30/",                "WB2OSZ-5>APDW14::W2UB     :Happy Birthday{001", 1);
+
+	pftest (229, "i/30",                 "WB2OSZ-5>APDW14::W2UB     :Happy Birthday{001", 1);
+	pftest (230, "i/",                   "WB2OSZ-5>APDW14::W2UB     :Happy Birthday{001", -1);
+
+	pftest (240, "s/", "WB2OSZ-5>APDW12:!4237.14N/07120.83WOPHG7140Chelmsford MA", -1);
+	pftest (241, "s/'/O/-/#/_", "WB2OSZ-5>APDW12:!4237.14N/07120.83WOPHG7140Chelmsford MA", -1);
+	pftest (242, "s/O/O/c", "WB2OSZ-5>APDW12:!4237.14N/07120.83WOPHG7140Chelmsford MA", -1);
+	pftest (243, "s/O/O/1/2", "WB2OSZ-5>APDW12:!4237.14N/07120.83WOPHG7140Chelmsford MA", -1);
+	pftest (244, "s/O/|/1", "WB2OSZ-5>APDW12:!4237.14N/07120.83WOPHG7140Chelmsford MA", -1);
+	pftest (245, "s//", "WB2OSZ-5>APDW12:!4237.14N/07120.83WOPHG7140Chelmsford MA", -1);
+	pftest (246, "s///", "WB2OSZ-5>APDW12:!4237.14N/07120.83WOPHG7140Chelmsford MA", -1);
+
+
+// TODO: to be continued...
 
 	if (error_count > 0) {
 	  text_color_set (DW_COLOR_ERROR);
-	  dw_printf ("Packet Filtering Test - FAILED!\n");
-	  exit (1);
+	  dw_printf ("\nPacket Filtering Test - FAILED!\n");
+	  exit (EXIT_FAILURE);
 	}
-	text_color_set (DW_COLOR_DEBUG );
-	dw_printf ("Packet Filtering Test - SUCCESS!\n");
-	exit (0);
+	text_color_set (DW_COLOR_REC);
+	dw_printf ("\nPacket Filtering Test - SUCCESS!\n");
+	exit (EXIT_SUCCESS);
 
 }
 
@@ -1052,7 +1744,7 @@ static void pftest (int test_num, char *filter, char *monitor, int expected)
 	pp = ax25_from_text (monitor, 1);
 	assert (pp != NULL);
 
-	result = pfilter (0, 0, filter, pp);
+	result = pfilter (0, 0, filter, pp, 1);
 	if (result != expected) {
 	  text_color_set (DW_COLOR_ERROR);
 	  dw_printf ("Unexpected result for test number %d\n", test_num);

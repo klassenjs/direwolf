@@ -96,6 +96,7 @@
 
 #define DEDUPE_C
 
+#include "direwolf.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -108,6 +109,9 @@
 #include "dedupe.h"
 #include "fcs_calc.h"
 #include "textcolor.h"
+#ifndef DIGITEST
+#include "igate.h"
+#endif
 
 
 /*------------------------------------------------------------------------------
@@ -205,6 +209,14 @@ void dedupe_remember (packet_t pp, int chan)
 	if (insert_next >= HISTORY_MAX) {
 	  insert_next = 0;
 	}
+
+	/* If we send something by digipeater, we don't */
+	/* want to do it again if it comes from APRS-IS. */
+	/* Not sure about the other way around. */
+
+#ifndef DIGITEST
+	ig_to_tx_remember (pp, chan, 1);
+#endif
 }
 
 

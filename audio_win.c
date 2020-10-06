@@ -1,13 +1,8 @@
 
-//#define DEBUGUDP 1
-//#define DEBUG 1
-
-#define STATISTICS 1
-
 //
 //    This file is part of Dire Wolf, an amateur radio packet TNC.
 //
-//    Copyright (C) 2011, 2012, 2013, 2014  John Langner, WB2OSZ
+//    Copyright (C) 2011, 2012, 2013, 2014, 2015  John Langner, WB2OSZ
 //
 //    This program is free software: you can redistribute it and/or modify
 //    it under the terms of the GNU General Public License as published by
@@ -44,6 +39,10 @@
  *---------------------------------------------------------------*/
 
 
+#include "direwolf.h"		// Sets _WIN32_WINNT for XP API level needed by ws2tcpip.h
+				// Also includes windows.h.
+
+
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/types.h>
@@ -53,7 +52,6 @@
 #include <io.h>
 #include <fcntl.h>
 
-#include <windows.h>		
 #include <mmsystem.h>
 
 #ifndef WAVE_FORMAT_96M16
@@ -62,12 +60,11 @@
 #endif
 
 #include <winsock2.h>
-#define _WIN32_WINNT 0x0501
-#include <ws2tcpip.h>
+#include <ws2tcpip.h>  		// _WIN32_WINNT must be set to 0x0501 before including this
 
 
-#include "direwolf.h"
 #include "audio.h"
+#include "audio_stats.h"
 #include "textcolor.h"
 #include "ptt.h"
 #include "demod.h"		/* for alevel_t & demod_get_audio_level() */
@@ -117,6 +114,17 @@ static int calcbufsize(int rate, int chans, int bits)
 	dw_printf ("audio_open: calcbufsize (rate=%d, chans=%d, bits=%d) calc size=%d, round up to %d\n",
 		rate, chans, bits, size1, size2);
 #endif
+
+	/* Version 1.3 - add a sanity check. */
+	if (size2 < 256 || size2 > 32768) {
+	  text_color_set(DW_COLOR_ERROR);
+	  dw_printf ("Audio buffer has unexpected extreme size of %d bytes.\n", size2);
+	  dw_printf ("Detected at %s, line %d.\n", __FILE__, __LINE__);
+	  dw_printf ("This might be caused by unusual audio device configuration values.\n"); 
+	  size2 = 2048;
+	  dw_printf ("Using %d to attempt recovery.\n", size2);
+	}
+
 	return (size2);
 }
 
@@ -279,7 +287,7 @@ int audio_open (struct audio_s *pa)
 
 	    A->udp_sock = INVALID_SOCKET;
 
-	    in_dev_no[a] = WAVE_MAPPER;	/* = -1 */
+	    in_dev_no[a] = WAVE_MAPPER;	/* = ((UINT)-1) in mmsystem.h */
 	    out_dev_no[a] = WAVE_MAPPER;
 
 /*
@@ -290,14 +298,14 @@ int audio_open (struct audio_s *pa)
 	    if (strcasecmp(pa->adev[a].adevice_in, "stdin") == 0 || strcmp(pa->adev[a].adevice_in, "-") == 0) {
 	      A->g_audio_in_type = AUDIO_IN_TYPE_STDIN;
 	      /* Change - to stdin for readability. */
-	      strcpy (pa->adev[a].adevice_in, "stdin");
+	      strlcpy (pa->adev[a].adevice_in, "stdin", sizeof(pa->adev[a].adevice_in));
 	    }
 	    else if (strncasecmp(pa->adev[a].adevice_in, "udp:", 4) == 0) {
 	      A->g_audio_in_type = AUDIO_IN_TYPE_SDR_UDP;
 	      /* Supply default port if none specified. */
 	      if (strcasecmp(pa->adev[a].adevice_in,"udp") == 0 ||
 	        strcasecmp(pa->adev[a].adevice_in,"udp:") == 0) {
-	        sprintf (pa->adev[a].adevice_in, "udp:%d", DEFAULT_UDP_AUDIO_PORT);
+	        snprintf (pa->adev[a].adevice_in, sizeof(pa->adev[a].adevice_in), "udp:%d", DEFAULT_UDP_AUDIO_PORT);
 	      }
 	    } 
 	    else {
@@ -305,23 +313,28 @@ int audio_open (struct audio_s *pa)
 
 	      /* Does config file have a number?  */
 	      /* If so, it is an index into list of devices. */
+	      /* Originally only a single digit was recognized.  */
+	      /* v 1.5 also recognizes two digits.  (Issue 116) */
 
 	      if (strlen(pa->adev[a].adevice_in) == 1 && isdigit(pa->adev[a].adevice_in[0])) {
+	        in_dev_no[a] = atoi(pa->adev[a].adevice_in);
+	      }
+	      else if (strlen(pa->adev[a].adevice_in) == 2 && isdigit(pa->adev[a].adevice_in[0]) && isdigit(pa->adev[a].adevice_in[1])) {
 	        in_dev_no[a] = atoi(pa->adev[a].adevice_in);
 	      }
 
 	      /* Otherwise, does it have search string? */
 
-	      if (in_dev_no[a] == WAVE_MAPPER && strlen(pa->adev[a].adevice_in) >= 1) {
+	      if ((UINT)(in_dev_no[a]) == WAVE_MAPPER && strlen(pa->adev[a].adevice_in) >= 1) {
 	        num_devices = waveInGetNumDevs();
-	        for (n=0 ; n<num_devices && in_dev_no[a] == WAVE_MAPPER ; n++) {
+	        for (n=0 ; n<num_devices && (UINT)(in_dev_no[a]) == WAVE_MAPPER ; n++) {
 	          if ( ! waveInGetDevCaps(n, &wic, sizeof(WAVEINCAPS))) {
 	            if (strstr(wic.szPname, pa->adev[a].adevice_in) != NULL) {
 	              in_dev_no[a] = n;
 	            }
 	          }
 	        }
-	        if (in_dev_no[a] == WAVE_MAPPER) {
+	        if ((UINT)(in_dev_no[a]) == WAVE_MAPPER) {
 	          text_color_set(DW_COLOR_ERROR);
 	          dw_printf ("\"%s\" doesn't match any of the input devices.\n", pa->adev[a].adevice_in);
 	        }
@@ -336,17 +349,20 @@ int audio_open (struct audio_s *pa)
 	    if (strlen(pa->adev[a].adevice_out) == 1 && isdigit(pa->adev[a].adevice_out[0])) {
 	      out_dev_no[a] = atoi(pa->adev[a].adevice_out);
 	    }
+	    else if (strlen(pa->adev[a].adevice_out) == 2 && isdigit(pa->adev[a].adevice_out[0]) && isdigit(pa->adev[a].adevice_out[1])) {
+	      out_dev_no[a] = atoi(pa->adev[a].adevice_out);
+	    }
 
-	    if (out_dev_no[a] == WAVE_MAPPER && strlen(pa->adev[a].adevice_out) >= 1) {
+	    if ((UINT)(out_dev_no[a]) == WAVE_MAPPER && strlen(pa->adev[a].adevice_out) >= 1) {
 	      num_devices = waveOutGetNumDevs();
-	      for (n=0 ; n<num_devices && out_dev_no[a] == WAVE_MAPPER ; n++) {
+	      for (n=0 ; n<num_devices && (UINT)(out_dev_no[a]) == WAVE_MAPPER ; n++) {
 	        if ( ! waveOutGetDevCaps(n, &woc, sizeof(WAVEOUTCAPS))) {
 	          if (strstr(woc.szPname, pa->adev[a].adevice_out) != NULL) {
 	            out_dev_no[a] = n;
 	          }
 	        }
 	      }
-	      if (out_dev_no[a] == WAVE_MAPPER) {
+	      if ((UINT)(out_dev_no[a]) == WAVE_MAPPER) {
 	        text_color_set(DW_COLOR_ERROR);
 	        dw_printf ("\"%s\" doesn't match any of the output devices.\n", pa->adev[a].adevice_out);
 	      }
@@ -754,18 +770,6 @@ int audio_get (int a)
 
         A = &(adev[a]); 
 
-#if defined(DEBUGUDP) || defined(STATISTICS)
-	
-	/* Gather numbers for read from UDP stream. */
-	/* Gather numbers for read from audio device. */
-
-#define duration 100			/* report every 100 seconds. */
-	static time_t last_time[MAX_ADEVS];
-	time_t this_time[MAX_ADEVS];
-	static int sample_count[MAX_ADEVS];
-	static int error_count[MAX_ADEVS];
-#endif
-
 	switch (A->g_audio_in_type) {
 
 /*
@@ -791,15 +795,26 @@ int audio_get (int a)
 // TODO1.2: Need more details.  Can we keep going?
 
 	          dw_printf ("Timeout waiting for input from audio device %d.\n", a);
+
+	          audio_stats (a, 
+			save_audio_config_p->adev[a].num_channels, 
+			0, 
+			save_audio_config_p->statistics_interval);
+
 	          return (-1);
 	        }
 	      }
 
 	      p = (WAVEHDR*)(A->in_headp);		/* no need to be volatile at this point */
 
-	      if (p->dwUser == -1) {
+	      if (p->dwUser == (DWORD)(-1)) {
 	        waveInUnprepareHeader(A->audio_in_handle, p, sizeof(WAVEHDR));
 	        p->dwUser = 0;	/* Index for next byte. */
+
+	        audio_stats (a, 
+			save_audio_config_p->adev[a].num_channels, 
+			p->dwBytesRecorded / (save_audio_config_p->adev[a].num_channels * save_audio_config_p->adev[a].bits_per_sample / 8), 
+			save_audio_config_p->statistics_interval);
 	      }
 
 	      if (p->dwUser < p->dwBytesRecorded) {
@@ -835,42 +850,26 @@ int audio_get (int a)
 
               assert (A->udp_sock > 0);
 
-	      res = recv (A->udp_sock, A->stream_data, SDR_UDP_BUF_MAXLEN, 0);
+	      res = SOCK_RECV (A->udp_sock, A->stream_data, SDR_UDP_BUF_MAXLEN);
 	      if (res <= 0) {
 	        text_color_set(DW_COLOR_ERROR);
 	        dw_printf ("Can't read from udp socket, errno %d", WSAGetLastError());
 	        A->stream_len = 0;
 	        A->stream_next = 0;
+
+	        audio_stats (a, 
+			save_audio_config_p->adev[a].num_channels, 
+			0, 
+			save_audio_config_p->statistics_interval);
+
 	        return (-1);
 	      } 
 
-#if DEBUGUDP
+	      audio_stats (a, 
+			save_audio_config_p->adev[a].num_channels, 
+			res / (save_audio_config_p->adev[a].num_channels * save_audio_config_p->adev[a].bits_per_sample / 8), 
+			save_audio_config_p->statistics_interval);
 
-// TODO: We should collect audio statistics like this for all types of input.  Move to common function.
-
-	      if (last_time[a] == 0) {
-	        last_time[a] = time(NULL);
-	        sample_count[a] = 0;
-	        error_count[a] = 0;
-	      }
-	      else {
-	        if (res > 0) {
-	           sample_count[a] += res/2;
-	        }
-	        else {
-	           error_count[a]++;
-	        }
-	        this_time[a] = time(NULL);
-	        if (this_time[a] >= last_time + duration) {
-	          text_color_set(DW_COLOR_DEBUG);
-	          dw_printf ("\ADEVICE%d: Past %d seconds, %d UDP audio samples processed, %d errors.\n\n", 
-			a, duration, sample_count[a], error_count[a]);
-	          last_time[a] = this_time[a];
-	          sample_count[a] = 0;
-	          error_count[a] = 0;
-	        }      
-	      }
-#endif
 	      A->stream_len = res;
 	      A->stream_next = 0;
 	    }
@@ -892,6 +891,11 @@ int audio_get (int a)
 	        dw_printf ("\nEnd of file on stdin.  Exiting.\n");
 	        exit (0);
 	      }
+
+	      audio_stats (a, 
+			save_audio_config_p->adev[a].num_channels, 
+			res / (save_audio_config_p->adev[a].num_channels * save_audio_config_p->adev[a].bits_per_sample / 8), 
+			save_audio_config_p->statistics_interval);
 	    
 	      A->stream_len = res;
 	      A->stream_next = 0;
@@ -947,7 +951,15 @@ int audio_put (int a, int c)
 	  timeout--;
 	  if (timeout <= 0) {
 	    text_color_set(DW_COLOR_ERROR);
+
+// TODO: open issues 78 & 165.  How can we avoid/improve this?
+
 	    dw_printf ("Audio output failure waiting for buffer.\n");
+	    dw_printf ("This can occur when we are producing audio output for\n");
+	    dw_printf ("transmit and the operating system doesn't provide buffer\n");
+	    dw_printf ("space after waiting and retrying many times.\n");
+	    //dw_printf ("In recent years, this has been reported only when running the\n");
+	    //dw_printf ("Windows version with VMWare on a Macintosh.\n");
 	    ptt_term ();
 	    return (-1);
 	  }
@@ -964,11 +976,11 @@ int audio_put (int a, int c)
 	/* Should never be full at this point. */
 
 	assert (p->dwBufferLength >= 0);
-	assert (p->dwBufferLength < A->outbuf_size);
+	assert (p->dwBufferLength < (DWORD)(A->outbuf_size));
 
 	p->lpData[p->dwBufferLength++] = c;
 
-	if (p->dwBufferLength == A->outbuf_size) {
+	if (p->dwBufferLength == (DWORD)(A->outbuf_size)) {
 	  return (audio_flush(a));
 	}
 

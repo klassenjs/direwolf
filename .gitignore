@@ -6,6 +6,8 @@ z*
 *~
 *.xlsx
 *.stackdump
+*.wav
+
 
 # Object files
 *.o
@@ -36,6 +38,26 @@ z*
 *.i*86
 *.x86_64
 *.hex
+
+# Binaries, other build results
+
+aclients
+atest
+decode_aprs
+direwolf
+gen_fff
+gen_packets
+ll2utm
+log2gpx
+text2tt
+tt2text
+ttcalc
+utm2ll
+
+direwolf.conf
+fsk_fast_filter.h
+direwolf.desktop
+
 
 # =========================
 # Operating System Files
@@ -83,3 +105,5 @@ $RECYCLE.BIN/
 
 # Windows shortcuts
 *.lnk
+/use_this_sdk
+*.dSYM

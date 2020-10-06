@@ -1,4 +1,3 @@
-
 //
 //    This file is part of Dire Wolf, an amateur radio packet TNC.
 //
@@ -25,6 +24,10 @@
  *
  * Purpose:	Packet assembler and disasembler.
  *
+ *		This was written when I was only concerned about APRS which
+ *		uses only UI frames.  ax25_pad2.c, added years later, has
+ *		functions for dealing with other types of frames.
+ *
  *   		We can obtain AX.25 packets from different sources:
  *		
  *		(a) from an HDLC frame.
@@ -45,22 +48,27 @@
  * Description:	
  *
  *
- *	A UI frame starts with 2-10 addressses (14-70 octets):
+ *	APRS uses only UI frames.
+ *	Each starts with 2-10 addressses (14-70 octets):
  *
- *	* Destination Address
+ *	* Destination Address  (note: opposite order in printed format)
+ *
  *	* Source Address
- *	* 0-8 Digipeater Addresses  (Could there ever be more as a result of 
- *					digipeaters inserting their own call
- *					and decrementing the remaining count in
- *					WIDEn-n, TRACEn-n, etc.?   
- *					NO.  The limit is 8 when transmitting AX.25 over the radio.
- *					However, communication with an IGate server could have 
- *					a longer VIA path but that is only in text form, not here.)
+ *
+ *	* 0-8 Digipeater Addresses  (Could there ever be more as a result of
+ *					digipeaters inserting their own call for
+ *					the tracing feature?
+ *					NO.  The limit is 8 when transmitting AX.25 over the
+ *					radio.
+ *					Communication with an IGate server could
+ *					have a longer VIA path but that is only in text form,
+ *					not as an AX.25 frame.)
  *
  *	Each address is composed of:
  *
  *	* 6 upper case letters or digits, blank padded.
- *		These are shifted left one bit, leaving the the LSB always 0.
+ *		These are shifted left one bit, leaving the LSB always 0.
+ *
  *	* a 7th octet containing the SSID and flags.
  *		The LSB is always 0 except for the last octet of the address field.
  *
@@ -73,11 +81,24 @@
  *			SSID = substation ID
  *			0 = zero
  *
+ *		The AX.25 spec states that the RR bits should be 11 if not used.
+ *		There are a couple documents talking about possible uses for APRS.
+ *		I'm ignoring them for now.
+ *		http://www.aprs.org/aprs12/preemptive-digipeating.txt
+ *		http://www.aprs.org/aprs12/RR-bits.txt
+ *
+ *		I don't recall why I originally intended to set the source/destination C bits both to 1.
+ *		Reviewing this 5 years later, after spending more time delving into the
+ *		AX.25 spec, I think it should be 1 for destination and 0 for source.
+ *		In practice you see all four combinations being used by APRS stations
+ *		and no one really cares about these two bits.
+ *
  *	The final octet of the Source has the form:
  *
  *		C R R SSID 0, where,
  *
- *			C = command/response = 1
+ *			C = command/response = 1    (originally, now I think it should be 0 for source.)
+ *						(Haven't gone back to check to see what code actually does.)
  *			R R = Reserved = 1 1
  *			SSID = substation ID
  *			0 = zero (or 1 if no repeaters)
@@ -97,8 +118,12 @@
  *		have the "H" bit set to 1.  
  *		The "H" bit would be set to 1 in the repeated frame.
  *
- *	When monitoring, an asterisk is displayed after the last digipeater with 
- *	the "H" bit set.  No asterisk means the source is being heard directly.
+ *	In standard monitoring format, an asterisk is displayed after the last
+ *	digipeater with the "H" bit set.  That indicates who you are hearing
+ *	over the radio.
+ *	(That is if digipeaters update the via path properly.  Some don't so
+ *	we don't know who we are hearing.  This is discussed in the User Guide.)
+ *	No asterisk means the source is being heard directly.
  *
  *	Example, if we can hear all stations involved,
  *
@@ -119,6 +144,10 @@
  *
  *	And, of course, the 2 byte CRC.
  *
+ * 	The descriptions above, for the C, H, and RR bits, are for APRS usage.
+ *	When operating as a KISS TNC we just pass everything along and don't
+ *	interpret or change them.
+ *
  *
  * Constructors: ax25_init		- Clear everything.
  *		ax25_from_text		- Tear apart a text string
@@ -134,16 +163,13 @@
 
 #define AX25_PAD_C		/* this will affect behavior of ax25_pad.h */
 
+#include "direwolf.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
 #include <stdio.h>
 #include <ctype.h>
-#ifndef _POSIX_C_SOURCE
-
-#define _POSIX_C_SOURCE 1
-#endif
 
 #include "regex.h"
 
@@ -151,8 +177,9 @@
 char *strtok_r(char *str, const char *delim, char **saveptr);
 #endif
 
-#include "ax25_pad.h"
+
 #include "textcolor.h"
+#include "ax25_pad.h"
 #include "fcs_calc.h"
 
 /*
@@ -206,7 +233,7 @@ int ax25memdebug_seq (packet_t this_p)
  *------------------------------------------------------------------------------*/
 
 
-static packet_t ax25_new (void) 
+packet_t ax25_new (void)
 {
 	struct packet_s *this_p;
 
@@ -222,7 +249,13 @@ static packet_t ax25_new (void)
 /*
  * check for memory leak.
  */
-	if (new_count > delete_count + 100) {
+
+// version 1.4 push up the threshold.   We could have considerably more with connected mode.
+
+	//if (new_count > delete_count + 100) {
+	if (new_count > delete_count + 256) {
+
+
 	  text_color_set(DW_COLOR_ERROR);
 	  dw_printf ("Report to WB2OSZ - Memory leak for packet objects.  new=%d, delete=%d\n", new_count, delete_count);
 #if AX25MEMDEBUG
@@ -232,10 +265,19 @@ static packet_t ax25_new (void)
 	}
 
 	this_p = calloc(sizeof (struct packet_s), (size_t)1);
+
+	if (this_p == NULL) {
+	  text_color_set(DW_COLOR_ERROR);
+	  dw_printf ("ERROR - can't allocate memory in ax25_new.\n");
+	}
+
+	assert (this_p != NULL);
+
 	this_p->magic1 = MAGIC;
 	this_p->seq = last_seq_num;
 	this_p->magic2 = MAGIC;
 	this_p->num_addr = (-1);
+
 	return (this_p);
 }
 
@@ -257,6 +299,13 @@ void ax25_delete (packet_t this_p)
         text_color_set(DW_COLOR_DEBUG);
         dw_printf ("ax25_delete(): before free, new=%d, delete=%d\n", new_count, delete_count);
 #endif
+
+	if (this_p == NULL) {
+	  text_color_set(DW_COLOR_ERROR);
+	  dw_printf ("ERROR - NULL pointer passed to ax25_delete.\n");
+	  return;
+	}
+
 
 	delete_count++;
 
@@ -286,8 +335,17 @@ void ax25_delete (packet_t this_p)
  * Purpose:	Parse a frame in human-readable monitoring format and change
  *		to internal representation.
  *
- * Input:	monitor	- "TNC-2" format of a monitored packet.  i.e.
+ * Input:	monitor	- "TNC-2" monitor format for packet.  i.e.
  *				source>dest[,repeater1,repeater2,...]:information
+ *
+ *			The information part can have non-printable characters
+ *			in the form of <0xff>.  This will be converted to single
+ *			bytes.  e.g.  <0x0d> is carriage return.
+ *			In version 1.4H we will allow nul characters which means
+ *			we have to maintain a length rather than using strlen().
+ *			I maintain that it violates the spec but want to handle it
+ *			because it does happen and we want to preserve it when
+ *			acting as an IGate rather than corrupting it.
  *
  *		strict	- True to enforce rules for packets sent over the air.
  *			  False to be more lenient for packets from IGate server.
@@ -320,17 +378,11 @@ packet_t ax25_from_text (char *monitor, int strict)
 	char *pa;
 	char *saveptr;		/* Used with strtok_r because strtok is not thread safe. */
 
-	static int first_time = 1;
-	static regex_t unhex_re;
-	int e;
-	char emsg[100];
-#define MAXMATCH 1
-	regmatch_t match[MAXMATCH];
-	int keep_going;
-	char temp[512];
 	int ssid_temp, heard_temp;
 	char atemp[AX25_MAX_ADDR_LEN];
 
+	char info_part[AX25_MAX_INFO_LEN+1];
+	int info_len;
 
 	packet_t this_p = ax25_new ();
 
@@ -343,58 +395,15 @@ packet_t ax25_from_text (char *monitor, int strict)
 
 	/* Is it possible to have a nul character (zero byte) in the */
 	/* information field of an AX.25 frame? */
-	/* Yes, but it would be difficult in the from-text case. */
+	/* At this point, we have a normal C string. */
+	/* It is possible that will convert <0x00> to a nul character later. */
+	/* There we need to maintain a separate length and not use normal C string functions. */
 
-	strcpy (stuff, monitor);
+	strlcpy (stuff, monitor, sizeof(stuff));
 
-/* 
- * Translate hexadecimal values like <0xff> to non-printing characters.
- * MIC-E message type uses 5 different non-printing characters.
- */
-
-	if (first_time) 
-	{
-	  e = regcomp (&unhex_re, "<0x[0-9a-fA-F][0-9a-fA-F]>", 0);
-	  if (e) {
-	    regerror (e, &unhex_re, emsg, sizeof(emsg));
-	    text_color_set(DW_COLOR_ERROR);
-	    dw_printf ("%s:%d: %s\n", __FILE__, __LINE__, emsg);
-	  }
-
-	  first_time = 0;
-	}
-
-#if 0
-	text_color_set(DW_COLOR_DEBUG);
-	dw_printf ("BEFORE: %s\n", stuff);
-	ax25_safe_print (stuff, -1, 0);
-	dw_printf ("\n");
-#endif
-	keep_going = 1;
-	while (keep_going) {
-	  if (regexec (&unhex_re, stuff, MAXMATCH, match, 0) == 0) {
-	    int n;
-	    char *p;
-  
-	    stuff[match[0].rm_so + 5] = '\0';
-	    n = strtol (stuff + match[0].rm_so + 3, &p, 16);
-	    stuff[match[0].rm_so] = n;
-	    strcpy (temp, stuff + match[0].rm_eo);
-	    strcpy (stuff + match[0].rm_so + 1, temp);
-	  }
-	  else {
-	    keep_going = 0;
-	  }
-	}
-#if 0
-	text_color_set(DW_COLOR_DEBUG);
-	dw_printf ("AFTER:  %s\n", stuff);
-	ax25_safe_print (stuff, -1, 0);
-	dw_printf ("\n");
-#endif
 
 /*
- * Initialize the packet with two addresses and control/pid
+ * Initialize the packet structure with two addresses and control/pid
  * for APRS.
  */
 	memset (this_p->frame_data + AX25_DESTINATION*7, ' ' << 1, 6);
@@ -404,7 +413,7 @@ packet_t ax25_from_text (char *monitor, int strict)
 	this_p->frame_data[AX25_SOURCE*7+6] = SSID_H_MASK | SSID_RR_MASK | SSID_LAST_MASK;
 
 	this_p->frame_data[14] = AX25_UI_FRAME;
-	this_p->frame_data[15] = AX25_NO_LAYER_3;
+	this_p->frame_data[15] = AX25_PID_NO_LAYER_3;
 
 	this_p->frame_len = 7 + 7 + 1 + 1;
 	this_p->num_addr = (-1);
@@ -424,12 +433,6 @@ packet_t ax25_from_text (char *monitor, int strict)
 	*pinfo = '\0';
 	pinfo++;
 
-	if (strlen(pinfo) > AX25_MAX_INFO_LEN) {
-	  text_color_set(DW_COLOR_ERROR);
-	  dw_printf ("Warning: Information part truncated to %d characters.\n", AX25_MAX_INFO_LEN);
-	  pinfo[AX25_MAX_INFO_LEN] = '\0';
-	}
-	
 /*
  * Separate the addresses.
  * Note that source and destination order is swappped.
@@ -447,16 +450,15 @@ packet_t ax25_from_text (char *monitor, int strict)
 	  return (NULL);
 	}
 
-	if ( ! ax25_parse_addr (pa, strict, atemp, &ssid_temp, &heard_temp)) {
+	if ( ! ax25_parse_addr (AX25_SOURCE, pa, strict, atemp, &ssid_temp, &heard_temp)) {
 	  text_color_set(DW_COLOR_ERROR);
 	  dw_printf ("Failed to create packet from text.  Bad source address\n");
 	  ax25_delete (this_p);
 	  return (NULL);
 	}
 
-	ax25_set_addr (this_p, AX25_SOURCE, pa);
+	ax25_set_addr (this_p, AX25_SOURCE, atemp);
 	ax25_set_h (this_p, AX25_SOURCE);	// c/r in this position
-
 	ax25_set_ssid (this_p, AX25_SOURCE, ssid_temp);
 
 /*
@@ -471,16 +473,15 @@ packet_t ax25_from_text (char *monitor, int strict)
 	  return (NULL);
 	}
 
-	if ( ! ax25_parse_addr (pa, strict, atemp, &ssid_temp, &heard_temp)) {
+	if ( ! ax25_parse_addr (AX25_DESTINATION, pa, strict, atemp, &ssid_temp, &heard_temp)) {
 	  text_color_set(DW_COLOR_ERROR);
 	  dw_printf ("Failed to create packet from text.  Bad destination address\n");
 	  ax25_delete (this_p);
 	  return (NULL);
 	}
 
-	ax25_set_addr (this_p, AX25_DESTINATION, pa);
+	ax25_set_addr (this_p, AX25_DESTINATION, atemp);
 	ax25_set_h (this_p, AX25_DESTINATION);	// c/r in this position
-
 	ax25_set_ssid (this_p, AX25_DESTINATION, ssid_temp);
 
 /*
@@ -488,22 +489,18 @@ packet_t ax25_from_text (char *monitor, int strict)
  */
 	while (( pa = strtok_r (NULL, ",", &saveptr)) != NULL && this_p->num_addr < AX25_MAX_ADDRS ) {
 
-	  //char *last;
 	  int k;
 
 	  k = this_p->num_addr;
 
-	  // JWL 10:38 this_p->num_addr++;
-
-	  if ( ! ax25_parse_addr (pa, strict, atemp, &ssid_temp, &heard_temp)) {
+	  if ( ! ax25_parse_addr (k, pa, strict, atemp, &ssid_temp, &heard_temp)) {
 	    text_color_set(DW_COLOR_ERROR);
 	    dw_printf ("Failed to create packet from text.  Bad digipeater address\n");
 	    ax25_delete (this_p);
 	    return (NULL);
 	  }
 
-	  ax25_set_addr (this_p, k, pa);
-	  
+	  ax25_set_addr (this_p, k, atemp);
 	  ax25_set_ssid (this_p, k, ssid_temp);
 
 	  // Does it have an "*" at the end? 
@@ -517,12 +514,61 @@ packet_t ax25_from_text (char *monitor, int strict)
 	  }
         }
 
+
+/*
+ * Finally, process the information part.
+ *
+ * Translate hexadecimal values like <0xff> to single bytes.
+ * MIC-E format uses 5 different non-printing characters.
+ * We might want to manually generate UTF-8 characters such as degree.
+ */
+
+//#define DEBUG14H 1
+
+#if DEBUG14H
+	text_color_set(DW_COLOR_DEBUG);
+	dw_printf ("BEFORE: %s\nSAFE:   ", pinfo);
+	ax25_safe_print (pinfo, -1, 0);
+	dw_printf ("\n");
+#endif
+
+	info_len = 0;
+	while (*pinfo != '\0' && info_len < AX25_MAX_INFO_LEN) {
+
+	  if (strlen(pinfo) >= 6 &&
+		pinfo[0] == '<' &&
+		pinfo[1] == '0' &&
+		pinfo[2] == 'x' &&
+		isxdigit(pinfo[3]) &&
+		isxdigit(pinfo[4]) &&
+		pinfo[5] == '>') {
+
+	    char *p;
+
+	    info_part[info_len] = strtol (pinfo + 3, &p, 16);
+	    info_len++;
+	    pinfo += 6;
+	  }
+	  else {
+	    info_part[info_len] = *pinfo;
+	    info_len++;
+	    pinfo++;
+	  }
+	}
+	info_part[info_len] = '\0';
+
+#if DEBUG14H
+	text_color_set(DW_COLOR_DEBUG);
+	dw_printf ("AFTER:  %s\nSAFE:   ", info_part);
+	ax25_safe_print (info_part, info_len, 0);
+	dw_printf ("\n");
+#endif
+
 /*
  * Append the info part.  
  */
-	strcpy ((char*)(this_p->frame_data+this_p->frame_len), pinfo);
-	this_p->frame_len += strlen(pinfo);
-
+	memcpy ((char*)(this_p->frame_data+this_p->frame_len), info_part, info_len);
+	this_p->frame_len += info_len;
 
 	return (this_p);
 }
@@ -554,12 +600,9 @@ packet_t ax25_from_frame_debug (unsigned char *fbuf, int flen, alevel_t alevel, 
 packet_t ax25_from_frame (unsigned char *fbuf, int flen, alevel_t alevel)
 #endif
 {
-	unsigned char *pf;
 	packet_t this_p;
 
-	int a;
-	int addr_bytes;
-	
+
 /*
  * First make sure we have an acceptable length:
  *
@@ -634,6 +677,8 @@ packet_t ax25_dup (packet_t copy_from)
 
 	
 	this_p = ax25_new ();
+	assert (this_p != NULL);
+
 	save_seq = this_p->seq;
 
 	memcpy (this_p, copy_from, sizeof (struct packet_s));
@@ -657,9 +702,12 @@ packet_t ax25_dup (packet_t copy_from)
  * 
  * Purpose:	Parse address with optional ssid.
  *
- * Inputs:	in_addr		- Input such as "WB2OSZ-15*"
+ * Inputs:	position	- AX25_DESTINATION, AX25_SOURCE, AX25_REPEATER_1...
+ *				  Used for more specific error message.  -1 if not used.
  *
- * 		strict		- TRUE for strict checking (6 characters, no lower case,
+ *		in_addr		- Input such as "WB2OSZ-15*"
+ *
+ * 		strict		- 1 (true) for strict checking (6 characters, no lower case,
  *				  SSID must be in range of 0 to 15).
  *				  Strict is appropriate for packets sent
  *				  over the radio.  Communication with IGate
@@ -667,6 +715,8 @@ packet_t ax25_dup (packet_t copy_from)
  *				  alphanumeric characters for the SSID.
  *				  We also get messages like this from a server.
  *					KB1POR>APU25N,TCPIP*,qAC,T2NUENGLD:...
+ *
+ *				  2 (extra true) will complain if * is found at end.
  *
  * Outputs:	out_addr	- Address without any SSID.
  *				  Must be at least AX25_MAX_ADDR_LEN bytes.
@@ -676,63 +726,97 @@ packet_t ax25_dup (packet_t copy_from)
  *		out_heard	- True if "*" found.
  *
  * Returns:	True (1) if OK, false (0) if any error.
+ *		When 0, out_addr, out_ssid, and out_heard are unpredictable.
  *
  *
  *------------------------------------------------------------------------------*/
 
+static const char *position_name[1 + AX25_MAX_ADDRS] = {
+	"", "Destination ", "Source ",
+	"Digi1 ", "Digi2 ", "Digi3 ", "Digi4 ",
+	"Digi5 ", "Digi6 ", "Digi7 ", "Digi8 " };
 
-int ax25_parse_addr (char *in_addr, int strict, char *out_addr, int *out_ssid, int *out_heard)
+int ax25_parse_addr (int position, char *in_addr, int strict, char *out_addr, int *out_ssid, int *out_heard)
 {
 	char *p;
-	char sstr[4];
+	char sstr[8];		/* Should be 1 or 2 digits for SSID. */
 	int i, j, k;
 	int maxlen;
 
-	strcpy (out_addr, "");
+	*out_addr = '\0';
 	*out_ssid = 0;
 	*out_heard = 0;
 
+	if (position < -1) position = -1;
+	if (position > AX25_REPEATER_8) position = AX25_REPEATER_8;
+	position++;	/* Adjust for position_name above. */
+
+
+	if (strict && strlen(in_addr) >= 2 && strncmp(in_addr, "qA", 2) == 0) {
+
+	  text_color_set(DW_COLOR_ERROR);
+	  dw_printf ("%sAddress \"%s\" is a \"q-construct\" used for communicating with\n", position_name[position], in_addr);
+	  dw_printf ("APRS Internet Servers.  It should never appear when going over the radio.\n");
+	}
+
 	//dw_printf ("ax25_parse_addr in: %s\n", in_addr);
+
 
 	maxlen = strict ? 6 : (AX25_MAX_ADDR_LEN-1);
 	p = in_addr;
 	i = 0;
-	for (p = in_addr; isalnum(*p); p++) {
+	for (p = in_addr; *p != '\0' && *p != '-' && *p != '*'; p++) {
 	  if (i >= maxlen) {
 	    text_color_set(DW_COLOR_ERROR);
-	    dw_printf ("Address is too long. \"%s\" has more than %d characters.\n", in_addr, maxlen);
+	    dw_printf ("%sAddress is too long. \"%s\" has more than %d characters.\n", position_name[position], in_addr, maxlen);
 	    return 0;
 	  }
+	  if ( ! isalnum(*p)) {
+	    text_color_set(DW_COLOR_ERROR);
+	    dw_printf ("%sAddress, \"%s\" contains character other than letter or digit in character position %d.\n", position_name[position], in_addr, (int)(long)(p-in_addr)+1);
+	    return 0;
+	  }
+
 	  out_addr[i++] = *p;
 	  out_addr[i] = '\0';
+
+#if DECAMAIN	// Hack when running in decode_aprs utility.
+		// Exempt the "qA..." case because it was already mentioned.
+
+	  if (strict && islower(*p) && strncmp(in_addr, "qA", 2) != 0) {
+	    text_color_set(DW_COLOR_ERROR);
+	    dw_printf ("%sAddress has lower case letters. \"%s\" must be all upper case.\n", position_name[position], in_addr);
+	  }
+#else
 	  if (strict && islower(*p)) {
 	    text_color_set(DW_COLOR_ERROR);
-	    dw_printf ("Address has lower case letters. \"%s\" must be all upper case.\n", in_addr);
+	    dw_printf ("%sAddress has lower case letters. \"%s\" must be all upper case.\n", position_name[position], in_addr);
 	    return 0;
 	  }
+#endif
 	}
 	
-	strcpy (sstr, "");
 	j = 0;
+	sstr[j] = '\0';
 	if (*p == '-') {
 	  for (p++; isalnum(*p); p++) {
 	    if (j >= 2) {
 	      text_color_set(DW_COLOR_ERROR);
-	      dw_printf ("SSID is too long. SSID part of \"%s\" has more than 2 characters.\n", in_addr);
+	      dw_printf ("%sSSID is too long. SSID part of \"%s\" has more than 2 characters.\n", position_name[position], in_addr);
 	      return 0;
 	    }
 	    sstr[j++] = *p;
 	    sstr[j] = '\0';
 	    if (strict && ! isdigit(*p)) {
 	      text_color_set(DW_COLOR_ERROR);
-	      dw_printf ("SSID must be digits. \"%s\" has letters in SSID.\n", in_addr);
+	      dw_printf ("%sSSID must be digits. \"%s\" has letters in SSID.\n", position_name[position], in_addr);
 	      return 0;
 	    }
 	  }
 	  k = atoi(sstr);
 	  if (k < 0 || k > 15) {
 	    text_color_set(DW_COLOR_ERROR);
-	    dw_printf ("SSID out of range. SSID of \"%s\" not in range of 0 to 15.\n", in_addr);
+	    dw_printf ("%sSSID out of range. SSID of \"%s\" not in range of 0 to 15.\n", position_name[position], in_addr);
 	    return 0;
 	  }
 	  *out_ssid = k;
@@ -741,11 +825,16 @@ int ax25_parse_addr (char *in_addr, int strict, char *out_addr, int *out_ssid, i
 	if (*p == '*') {
 	  *out_heard = 1;
 	  p++;
+	  if (strict == 2) {
+	    text_color_set(DW_COLOR_ERROR);
+	    dw_printf ("\"*\" is not allowed at end of address \"%s\" here.\n", in_addr);
+	    return 0;
+	  }
 	}
 
 	if (*p != '\0') {
-	    text_color_set(DW_COLOR_ERROR);
-	    dw_printf ("Invalid character \"%c\" found in address \"%s\".\n", *p, in_addr);
+	  text_color_set(DW_COLOR_ERROR);
+	  dw_printf ("Invalid character \"%c\" found in %saddress \"%s\".\n", *p, position_name[position], in_addr);
 	  return 0;
 	}
 
@@ -754,6 +843,73 @@ int ax25_parse_addr (char *in_addr, int strict, char *out_addr, int *out_ssid, i
 	return (1);
 
 } /* end ax25_parse_addr */
+
+
+/*-------------------------------------------------------------------
+ *
+ * Name:        ax25_check_addresses
+ *
+ * Purpose:     Check addresses of given packet and print message if any issues.
+ *		We call this when receiving and transmitting.
+ *
+ * Inputs:	pp	- packet object pointer.
+ *
+ * Errors:	Print error message.
+ *
+ * Returns:	1 for all valid.  0 if not.
+ *
+ * Examples:	I was surprised to get this from an APRS-IS server with
+ *		a lower case source address.
+ *
+ *			n1otx>APRS,TCPIP*,qAC,THIRD:@141335z4227.48N/07111.73W_348/005g014t044r000p000h60b10075.wview_5_20_2
+ *
+ *		I haven't gotten to the bottom of this yet but it sounds
+ *		like "q constructs" are somehow getting on to the air when
+ *		they should only appear in conversations with IGate servers.
+ *
+ *			https://groups.yahoo.com/neo/groups/direwolf_packet/conversations/topics/678
+ *
+ *			WB0VGI-7>APDW12,W0YC-5*,qAR,AE0RF-10:}N0DZQ-10>APWW10,TCPIP,WB0VGI-7*:;145.230MN*080306z4607.62N/09230.58WrKE0ACL/R 145.230- T146.2 (Pine County ARES)	
+ *
+ * Typical result:
+ *
+ *			Digipeater WIDE2 (probably N3LEE-4) audio level = 28(10/6)   [NONE]   __|||||||
+ *			[0.5] VE2DJE-9>P_0_P?,VE2PCQ-3,K1DF-7,N3LEE-4,WIDE2*:'{S+l <0x1c>>/
+ *			Invalid character "_" in MIC-E destination/latitude.
+ *			Invalid character "_" in MIC-E destination/latitude.
+ *			Invalid character "?" in MIC-E destination/latitude.
+ *			Invalid MIC-E N/S encoding in 4th character of destination.
+ *			Invalid MIC-E E/W encoding in 6th character of destination.
+ *			MIC-E, normal car (side view), Unknown manufacturer, Returning
+ *			N 00 00.0000, E 005 55.1500, 0 MPH
+ *			Invalid character "_" found in Destination address "P_0_P?".
+ *
+ *			*** The origin and journey of this packet should receive some scrutiny. ***
+ *
+ *--------------------------------------------------------------------*/
+
+int ax25_check_addresses (packet_t pp)
+{
+	int n;
+	char addr[AX25_MAX_ADDR_LEN];
+	char ignore1[AX25_MAX_ADDR_LEN];
+	int ignore2, ignore3;
+	int all_ok = 1;
+
+	for (n = 0; n < ax25_get_num_addr(pp); n++) {
+	  ax25_get_addr_with_ssid (pp, n, addr);
+	  all_ok &= ax25_parse_addr (n, addr, 1, ignore1, &ignore2, &ignore3);
+	}
+
+	if (! all_ok) {
+	  text_color_set(DW_COLOR_ERROR);
+	  dw_printf ("\n");
+	  dw_printf ("*** The origin and journey of this packet should receive some scrutiny. ***\n");
+	  dw_printf ("\n");
+	}
+
+	return (all_ok);
+} /* end ax25_check_addresses */
 
 
 /*------------------------------------------------------------------------------
@@ -784,7 +940,10 @@ packet_t ax25_unwrap_third_party (packet_t from_pp)
 
 	(void) ax25_get_info (from_pp, &info_p);
 
-	result_pp = ax25_from_text((char *)info_p + 1, 0);
+	// Want strict because addresses should conform to AX.25 here.
+	// That's not the case for something from an Internet Server.
+
+	result_pp = ax25_from_text((char *)info_p + 1, 1);
 
 	return (result_pp);
 }
@@ -822,7 +981,6 @@ void ax25_set_addr (packet_t this_p, int n, char *ad)
 	assert (this_p->magic1 == MAGIC);
 	assert (this_p->magic2 == MAGIC);
 	assert (n >= 0 && n < AX25_MAX_ADDRS);
-	assert (strlen(ad) < AX25_MAX_ADDR_LEN);
 
 	//dw_printf ("ax25_set_addr (%d, %s) num_addr=%d\n", n, ad, this_p->num_addr);
 
@@ -832,7 +990,12 @@ void ax25_set_addr (packet_t this_p, int n, char *ad)
 /* 
  * Set existing address position. 
  */
-	  ax25_parse_addr (ad, 0, atemp, &ssid_temp, &heard_temp);
+
+	  // Why aren't we setting 'strict' here?
+	  // Messages from IGate have q-constructs.
+	  // We use this to parse it and later remove unwanted parts.
+
+	  ax25_parse_addr (n, ad, 0, atemp, &ssid_temp, &heard_temp);
 
 	  memset (this_p->frame_data + n*7, ' ' << 1, 6);
 
@@ -891,7 +1054,6 @@ void ax25_set_addr (packet_t this_p, int n, char *ad)
 
 void ax25_insert_addr (packet_t this_p, int n, char *ad)
 {
-	int k;
 	int ssid_temp, heard_temp;
 	char atemp[AX25_MAX_ADDR_LEN];
 	int i;
@@ -900,7 +1062,6 @@ void ax25_insert_addr (packet_t this_p, int n, char *ad)
 	assert (this_p->magic1 == MAGIC);
 	assert (this_p->magic2 == MAGIC);
 	assert (n >= AX25_REPEATER_1 && n < AX25_MAX_ADDRS);
-	assert (strlen(ad) < AX25_MAX_ADDR_LEN);
 
 	//dw_printf ("ax25_insert_addr (%d, %s)\n", n, ad);
 
@@ -922,7 +1083,11 @@ void ax25_insert_addr (packet_t this_p, int n, char *ad)
 
 	SET_LAST_ADDR_FLAG;
 
-	ax25_parse_addr (ad, 0, atemp, &ssid_temp, &heard_temp);
+	// Why aren't we setting 'strict' here?
+	// Messages from IGate have q-constructs.
+	// We use this to parse it and later remove unwanted parts.
+
+	ax25_parse_addr (n, ad, 0, atemp, &ssid_temp, &heard_temp);
 	memset (this_p->frame_data + n*7, ' ' << 1, 6);
 	for (i=0; i<6 && atemp[i] != '\0'; i++) {
 	  this_p->frame_data[n*7+i] = atemp[i] << 1;
@@ -962,7 +1127,6 @@ void ax25_insert_addr (packet_t this_p, int n, char *ad)
 
 void ax25_remove_addr (packet_t this_p, int n)
 {
-	int k;
 	int expect; 
 
 	assert (this_p->magic1 == MAGIC);
@@ -1008,7 +1172,7 @@ void ax25_remove_addr (packet_t this_p, int n)
 
 int ax25_get_num_addr (packet_t this_p)
 {
-	unsigned char *pf;
+	//unsigned char *pf;
 	int a;
 	int addr_bytes;
 
@@ -1081,6 +1245,8 @@ int ax25_get_num_repeaters (packet_t this_p)
  *
  * Outputs:	station - String representation of the station, including the SSID.
  *			e.g.  "WB2OSZ-15"
+ *			  Usually variables will be AX25_MAX_ADDR_LEN bytes
+ *			  but 10 would be adequate.
  *
  * Bugs:	No bounds checking is performed.  Be careful.
  *		  
@@ -1094,7 +1260,7 @@ int ax25_get_num_repeaters (packet_t this_p)
 void ax25_get_addr_with_ssid (packet_t this_p, int n, char *station)
 {	
 	int ssid;
-	char sstr[4];
+	char sstr[8];		/* Should be 1 or 2 digits for SSID. */
 	int i;
 
 	assert (this_p->magic1 == MAGIC);
@@ -1105,7 +1271,7 @@ void ax25_get_addr_with_ssid (packet_t this_p, int n, char *station)
 	  text_color_set(DW_COLOR_ERROR);
 	  dw_printf ("Internal error detected in ax25_get_addr_with_ssid, %s, line %d.\n", __FILE__, __LINE__);
 	  dw_printf ("Address index, %d, is less than zero.\n", n);
-	  strcpy (station, "??????");
+	  strlcpy (station, "??????", 10);
 	  return;
 	}
 
@@ -1113,25 +1279,103 @@ void ax25_get_addr_with_ssid (packet_t this_p, int n, char *station)
 	  text_color_set(DW_COLOR_ERROR);
 	  dw_printf ("Internal error detected in ax25_get_addr_with_ssid, %s, line %d.\n", __FILE__, __LINE__);
 	  dw_printf ("Address index, %d, is too large for number of addresses, %d.\n", n, this_p->num_addr);
-	  strcpy (station, "??????");
+	  strlcpy (station, "??????", 10);
 	  return;
 	}
 
-	memset (station, 0, 7);
-	for (i=0; i<6; i++) {
-	  unsigned char ch;
+	// At one time this would stop at the first space, on the assumption we would have only trailing spaces.
+	// Then there was a forum discussion where someone encountered the address " WIDE2" with a leading space.
+	// In that case, we would have returned a zero length string here.
+	// Now we return exactly what is in the address field and trim trailing spaces.
+	// This will provide better information for troubleshooting.
 
-	  ch = (this_p->frame_data[n*7+i] >> 1) & 0x7f;
-	  if (ch <= ' ') break;
-	  station[i] = ch;
+	for (i=0; i<6; i++) {
+	  station[i] = (this_p->frame_data[n*7+i] >> 1) & 0x7f;
+	}
+	station[6] = '\0';
+
+	for (i=5; i>=0; i--) {
+	  if (station[i] == ' ')
+	    station[i] = '\0';
+	  else
+	    break;
 	}
 
 	ssid = ax25_get_ssid (this_p, n);
 	if (ssid != 0) {
-	  sprintf (sstr, "-%d", ssid);
-	  strcat (station, sstr);
-	}   
-}
+	  snprintf (sstr, sizeof(sstr), "-%d", ssid);
+	  strlcat (station, sstr, 10);
+	}
+
+} /* end ax25_get_addr_with_ssid */
+
+
+/*------------------------------------------------------------------------------
+ *
+ * Name:	ax25_get_addr_no_ssid
+ * 
+ * Purpose:	Return specified address WITHOUT any SSID.
+ *
+ * Inputs:	n	- Index of address.   Use the symbols 
+ *			  AX25_DESTINATION, AX25_SOURCE, AX25_REPEATER1, etc.
+ *
+ * Outputs:	station - String representation of the station, WITHOUT the SSID.
+ *			e.g.  "WB2OSZ"
+ *			  Usually variables will be AX25_MAX_ADDR_LEN bytes
+ *			  but 7 would be adequate.
+ *
+ * Bugs:	No bounds checking is performed.  Be careful.
+ *		  
+ * Assumption:	ax25_from_text or ax25_from_frame was called first.
+ *
+ * Returns:	Character string in usual human readable format,
+ *		
+ *
+ *------------------------------------------------------------------------------*/
+
+void ax25_get_addr_no_ssid (packet_t this_p, int n, char *station)
+{	
+	int i;
+
+	assert (this_p->magic1 == MAGIC);
+	assert (this_p->magic2 == MAGIC);
+
+
+	if (n < 0) {
+	  text_color_set(DW_COLOR_ERROR);
+	  dw_printf ("Internal error detected in ax25_get_addr_no_ssid, %s, line %d.\n", __FILE__, __LINE__);
+	  dw_printf ("Address index, %d, is less than zero.\n", n);
+	  strlcpy (station, "??????", 7);
+	  return;
+	}
+
+	if (n >= this_p->num_addr) {
+	  text_color_set(DW_COLOR_ERROR);
+	  dw_printf ("Internal error detected in ax25_get_no_with_ssid, %s, line %d.\n", __FILE__, __LINE__);
+	  dw_printf ("Address index, %d, is too large for number of addresses, %d.\n", n, this_p->num_addr);
+	  strlcpy (station, "??????", 7);
+	  return;
+	}
+
+	// At one time this would stop at the first space, on the assumption we would have only trailing spaces.
+	// Then there was a forum discussion where someone encountered the address " WIDE2" with a leading space.
+	// In that case, we would have returned a zero length string here.
+	// Now we return exactly what is in the address field and trim trailing spaces.
+	// This will provide better information for troubleshooting.
+
+	for (i=0; i<6; i++) {
+	  station[i] = (this_p->frame_data[n*7+i] >> 1) & 0x7f;
+	}
+	station[6] = '\0';
+
+	for (i=5; i>=0; i--) {
+	  if (station[i] == ' ')
+	    station[i] = '\0';
+	  else
+	    break;
+	}
+
+} /* end ax25_get_addr_no_ssid */
 
 
 /*------------------------------------------------------------------------------
@@ -1341,13 +1585,46 @@ int ax25_get_first_not_repeated(packet_t this_p)
 
 /*------------------------------------------------------------------------------
  *
+ * Name:	ax25_get_rr
+ *
+ * Purpose:	Return the two reserved "RR" bits in the specified address field.
+ *
+ * Inputs:	pp	- Packet object.
+ *
+ *		n	- Index of address.   Use the symbols
+ *			  AX25_DESTINATION, AX25_SOURCE, AX25_REPEATER1, etc.
+ *
+ * Returns:	0, 1, 2, or 3.
+ *
+ *------------------------------------------------------------------------------*/
+
+int ax25_get_rr (packet_t this_p, int n)
+{
+
+	assert (this_p->magic1 == MAGIC);
+	assert (this_p->magic2 == MAGIC);
+	assert (n >= 0 && n < this_p->num_addr);
+
+	if (n >= 0 && n < this_p->num_addr) {
+	  return ((this_p->frame_data[n*7+6] & SSID_RR_MASK) >> SSID_RR_SHIFT);
+	}
+	else {
+	  text_color_set(DW_COLOR_ERROR);
+	  dw_printf ("Internal error: ax25_get_rr(%d), num_addr=%d\n", n, this_p->num_addr);
+	  return (0);
+	}
+}
+
+
+/*------------------------------------------------------------------------------
+ *
  * Name:	ax25_get_info
  * 
  * Purpose:	Obtain Information part of current packet.
  *
- * Inputs:	None.
+ * Inputs:	this_p	- Packet object pointer.
  *
- * Outputs:	paddr	- Starting address is returned here.
+ * Outputs:	paddr	- Starting address of information part is returned here.
  *
  * Assumption:	ax25_from_text or ax25_from_frame was called first.
  *
@@ -1388,6 +1665,56 @@ int ax25_get_info (packet_t this_p, unsigned char **paddr)
 
 	*paddr = info_ptr;
 	return (info_len);
+
+} /* end ax25_get_info */
+
+
+/*------------------------------------------------------------------------------
+ *
+ * Name:	ax25_cut_at_crlf
+ *
+ * Purpose:	Truncate the information part at the first CR or LF.
+ *		This is used for the RF>IS IGate function.
+ *		CR/LF is used as record separator so we must remove it
+ *		before packaging up packet to sending to server.
+ *
+ * Inputs:	this_p	- Packet object pointer.
+ *
+ * Outputs:	Packet is modified in place.
+ *
+ * Returns:	Number of characters removed from the end.
+ *		0 if not changed.
+ *
+ * Assumption:	ax25_from_text or ax25_from_frame was called first.
+ *
+ *------------------------------------------------------------------------------*/
+
+int ax25_cut_at_crlf (packet_t this_p)
+{
+	unsigned char *info_ptr;
+	int info_len;
+	int j;
+
+
+	assert (this_p->magic1 == MAGIC);
+	assert (this_p->magic2 == MAGIC);
+
+	info_len = ax25_get_info (this_p, &info_ptr);
+
+	// Can't use strchr because there is potential of nul character.
+
+	for (j = 0; j < info_len; j++) {
+
+	  if (info_ptr[j] == '\r' || info_ptr[j] == '\n') {
+
+	    int chop = info_len - j;
+
+	    this_p->frame_len -= chop;
+	    return (chop);
+	  }
+	}
+
+	return (0);
 }
 
 
@@ -1456,9 +1783,67 @@ packet_t ax25_get_nextp (packet_t this_p)
 {
 	assert (this_p->magic1 == MAGIC);
 	assert (this_p->magic2 == MAGIC);
-	
+
 	return (this_p->nextp);
 }
+
+
+/*------------------------------------------------------------------------------
+ *
+ * Name:	ax25_set_release_time
+ *
+ * Purpose:	Set release time
+ *
+ * Inputs:	this_p		- Current packet object.
+ *
+ *		release_time	- Time as returned by dtime_now().
+ *
+ *------------------------------------------------------------------------------*/
+
+void ax25_set_release_time (packet_t this_p, double release_time)
+{
+	assert (this_p->magic1 == MAGIC);
+	assert (this_p->magic2 == MAGIC);
+	
+	this_p->release_time = release_time;
+}
+
+
+
+/*------------------------------------------------------------------------------
+ *
+ * Name:	ax25_get_release_time
+ *
+ * Purpose:	Get release time.
+ *
+ *------------------------------------------------------------------------------*/
+
+double ax25_get_release_time (packet_t this_p)
+{
+	assert (this_p->magic1 == MAGIC);
+	assert (this_p->magic2 == MAGIC);
+
+	return (this_p->release_time);
+}
+
+
+/*------------------------------------------------------------------------------
+ *
+ * Name:	ax25_set_modulo
+ *
+ * Purpose:	Set modulo value for I and S frame sequence numbers.
+ *
+ *------------------------------------------------------------------------------*/
+
+void ax25_set_modulo (packet_t this_p, int modulo)
+{
+	assert (this_p->magic1 == MAGIC);
+	assert (this_p->magic2 == MAGIC);
+
+	this_p->modulo = modulo;
+}
+
+
 
 
 
@@ -1489,6 +1874,8 @@ packet_t ax25_get_nextp (packet_t this_p)
  *
  *
  *------------------------------------------------------------------*/
+
+// TODO: max len for result.  buffer overflow?
 
 void ax25_format_addrs (packet_t this_p, char *result)
 {
@@ -1532,6 +1919,64 @@ void ax25_format_addrs (packet_t this_p, char *result)
 
 /*------------------------------------------------------------------
  *
+ * Function:	ax25_format_via_path
+ *
+ * Purpose:	Format via path addresses suitable for printing.
+ *
+ * Inputs:	Current packet.
+ *
+ *		result_size	- Number of bytes available for result.
+ *				  We can have up to 8 addresses x 9 characters
+ *				  plus 7 commas, possible *, and nul = 81 minimum.
+ *
+ * Outputs:	result	- Digipeater field addresses combined into a single string of the form:
+ *
+ *				"repeater, repeater ..."
+ *
+ *			An asterisk is displayed after the last digipeater
+ *			with the "H" bit set.  e.g.  If we hear RPT2,
+ *
+ *			RPT1,RPT2*,RPT3
+ *
+ *			No asterisk means the source is being heard directly.
+ *
+ *------------------------------------------------------------------*/
+
+void ax25_format_via_path (packet_t this_p, char *result, size_t result_size)
+{
+	int i;
+	int heard;
+	char stemp[AX25_MAX_ADDR_LEN];
+
+	assert (this_p->magic1 == MAGIC);
+	assert (this_p->magic2 == MAGIC);
+	*result = '\0';
+
+	/* Don't get upset if no addresses.  */
+	/* This will allow packets that do not comply to AX.25 format. */
+
+	if (this_p->num_addr == 0) {
+	  return;
+	}
+
+	heard = ax25_get_heard(this_p);
+
+	for (i=(int)AX25_REPEATER_1; i<this_p->num_addr; i++) {
+	  if (i > (int)AX25_REPEATER_1) {
+	    strlcat (result, ",", result_size);
+	  }
+	  ax25_get_addr_with_ssid (this_p, i, stemp);
+	  strlcat (result, stemp, result_size);
+	  if (i == heard) {
+	    strlcat (result, "*", result_size);
+	  }
+	}
+
+} /* end ax25_format_via_path */
+
+
+/*------------------------------------------------------------------
+ *
  * Function:	ax25_pack
  *
  * Purpose:	Put all the pieces into format ready for transmission.
@@ -1555,7 +2000,7 @@ int ax25_pack (packet_t this_p, unsigned char result[AX25_MAX_PACKET_LEN])
 	assert (this_p->magic1 == MAGIC);
 	assert (this_p->magic2 == MAGIC);
 
-	assert (this_p->frame_len > 0 && this_p->frame_len <= AX25_MAX_PACKET_LEN);
+	assert (this_p->frame_len >= 0 && this_p->frame_len <= AX25_MAX_PACKET_LEN);
 
 	memcpy (result, this_p->frame_data, this_p->frame_len);
 
@@ -1574,12 +2019,11 @@ int ax25_pack (packet_t this_p, unsigned char result[AX25_MAX_PACKET_LEN])
  *
  * Inputs:	this_p	- pointer to packet object.
  *		
- * 		modulo	- We often need to know this because context is
- *			  required to know if control is 1 or 2 bytes.
- *
  * Outputs:	desc	- Text description such as "I frame" or
  *			  "U frame SABME".   
- *			  Supply 16 bytes to be safe.
+ *			  Supply 40 bytes to be safe.
+ *
+ *		cr	- Command or response?
  *
  *		pf	- P/F - Poll/Final or -1 if not applicable
  *
@@ -1591,32 +2035,89 @@ int ax25_pack (packet_t this_p, unsigned char result[AX25_MAX_PACKET_LEN])
  *
  *------------------------------------------------------------------*/
 
+// TODO: need someway to ensure caller allocated enough space.
+// Should pass in as parameter.
+#define DESC_SIZ 40
 
 
-ax25_frame_type_t ax25_frame_type (packet_t this_p, ax25_modulo_t modulo, char *desc, int *pf, int *nr, int *ns) 
+ax25_frame_type_t ax25_frame_type (packet_t this_p, cmdres_t *cr, char *desc, int *pf, int *nr, int *ns) 
 {
-	int c;
+	int c;		// U frames are always one control byte.
+	int c2 = 0;	// I & S frames can have second Control byte.
 
 	assert (this_p->magic1 == MAGIC);
 	assert (this_p->magic2 == MAGIC);
 
-	strcpy (desc, "????");
+	strlcpy (desc, "????", DESC_SIZ);
+	*cr = cr_11;
 	*pf = -1;
 	*nr = -1;
 	*ns = -1;
 
 	c = ax25_get_control(this_p);
 	if (c < 0) {
-	  strcpy (desc, "Not AX.25");
+	  strlcpy (desc, "Not AX.25", DESC_SIZ);
 	  return (frame_not_AX25);
+	}
+
+/*
+ * TERRIBLE HACK :-(  for display purposes.
+ *
+ * I and S frames can have 1 or 2 control bytes but there is
+ * no good way to determine this without dipping into the data
+ * link state machine.  Can we guess?
+ *
+ * S frames have no protocol id or information so if there is one
+ * more byte beyond the control field, we could assume there are
+ * two control bytes.
+ *
+ * For I frames, the protocol id will usually be 0xf0.  If we find
+ * that as the first byte of the information field, it is probably
+ * the pid and not part of the information.  Ditto for segments 0x08.
+ * Not fool proof but good enough for troubleshooting text out.
+ *
+ * If we have a link to the peer station, this will be set properly
+ * before it needs to be used for other reasons.
+ *
+ * Setting one of the RR bits (find reference!) is sounding better and better.
+ * It's in common usage so I should lobby to get that in the official protocol spec.
+ */
+
+	if (this_p->modulo == 0 && (c & 3) == 1 && ax25_get_c2(this_p) != -1) {
+	  this_p->modulo = modulo_128;
+	}
+	else if (this_p->modulo == 0 && (c & 1) == 0 && this_p->frame_data[ax25_get_info_offset(this_p)] == 0xF0) {
+	  this_p->modulo = modulo_128;
+	}
+	else if (this_p->modulo == 0 && (c & 1) == 0 && this_p->frame_data[ax25_get_info_offset(this_p)] == 0x08) {	// same for segments
+	  this_p->modulo = modulo_128;
+	}
+
+
+	if (this_p->modulo == modulo_128) {
+	  c2 = ax25_get_c2 (this_p);
+	}
+
+	int dst_c = this_p->frame_data[AX25_DESTINATION * 7 + 6] & SSID_H_MASK;
+	int src_c = this_p->frame_data[AX25_SOURCE * 7 + 6] & SSID_H_MASK;
+
+	char cr_text[8];
+	char pf_text[8];
+
+	if (dst_c) {
+	  if (src_c) { *cr = cr_11;  strcpy(cr_text,"cc=11"); strcpy(pf_text,"p/f"); }
+	  else       { *cr = cr_cmd; strcpy(cr_text,"cmd");   strcpy(pf_text,"p"); }
+	}
+	else {
+	  if (src_c) { *cr = cr_res; strcpy(cr_text,"res");   strcpy(pf_text,"f"); }
+	  else       { *cr = cr_00;  strcpy(cr_text,"cc=00"); strcpy(pf_text,"p/f"); }
 	}
 
 	if ((c & 1) == 0) {
 
-// Information
+// Information 			rrr p sss 0		or	sssssss 0  rrrrrrr p
 
-	  if (modulo == modulo_128) {
-	    int c2 = ax25_get_c2 (this_p);	
+	  if (this_p->modulo == modulo_128) {
 	    *ns = (c >> 1) & 0x7f;
 	    *pf = c2 & 1;
 	    *nr = (c2 >> 1) & 0x7f;
@@ -1626,15 +2127,16 @@ ax25_frame_type_t ax25_frame_type (packet_t this_p, ax25_modulo_t modulo, char *
 	    *pf = (c >> 4) & 1;
 	    *nr = (c >> 5) & 7;
 	  }
-	  strcpy (desc, "I frame");
+
+	  //snprintf (desc, DESC_SIZ, "I %s, n(s)=%d, n(r)=%d, %s=%d", cr_text, *ns, *nr, pf_text, *pf);
+	  snprintf (desc, DESC_SIZ, "I %s, n(s)=%d, n(r)=%d, %s=%d, pid=0x%02x", cr_text, *ns, *nr, pf_text, *pf, ax25_get_pid(this_p));
 	  return (frame_type_I);
 	}
 	else if ((c & 2) == 0) {
 
-// Supervisory
+// Supervisory			rrr p/f ss 0 1		or	0000 ss 0 1  rrrrrrr p/f
 
-	  if (modulo == modulo_128) {
-	    int c2 = ax25_get_c2 (this_p);	
+	  if (this_p->modulo == modulo_128) {
 	    *pf = c2 & 1;
 	    *nr = (c2 >> 1) & 0x7f;
 	  }
@@ -1642,41 +2144,44 @@ ax25_frame_type_t ax25_frame_type (packet_t this_p, ax25_modulo_t modulo, char *
 	    *pf = (c >> 4) & 1;
 	    *nr = (c >> 5) & 7;
 	  }
-	  
+
+ 
 	  switch ((c >> 2) & 3) {
-	    case 0: strcpy (desc, "S frame RR");   return (frame_type_RR);   break;
-	    case 1: strcpy (desc, "S frame RNR");  return (frame_type_RNR);  break;
-	    case 2: strcpy (desc, "S frame REJ");  return (frame_type_REJ);  break;
-	    case 3: strcpy (desc, "S frame SREJ"); return (frame_type_SREJ); break;
+	    case 0: snprintf (desc, DESC_SIZ, "RR %s, n(r)=%d, %s=%d", cr_text, *nr, pf_text, *pf);   return (frame_type_S_RR);   break;
+	    case 1: snprintf (desc, DESC_SIZ, "RNR %s, n(r)=%d, %s=%d", cr_text, *nr, pf_text, *pf);  return (frame_type_S_RNR);  break;
+	    case 2: snprintf (desc, DESC_SIZ, "REJ %s, n(r)=%d, %s=%d", cr_text, *nr, pf_text, *pf);  return (frame_type_S_REJ);  break;
+	    case 3: snprintf (desc, DESC_SIZ, "SREJ %s, n(r)=%d, %s=%d", cr_text, *nr, pf_text, *pf); return (frame_type_S_SREJ); break;
 	 } 
 	}
 	else {
 
-// Unnumbered
+// Unnumbered			mmm p/f mm 1 1
 
 	  *pf = (c >> 4) & 1;
 	  
 	  switch (c & 0xef) {
 	
-	    case 0x6f: strcpy (desc, "U frame SABME"); return (frame_type_SABME); break;
-	    case 0x2f: strcpy (desc, "U frame SABM");  return (frame_type_SABM);  break;
-	    case 0x43: strcpy (desc, "U frame DISC");  return (frame_type_DISC);  break;
-	    case 0x0f: strcpy (desc, "U frame DM");    return (frame_type_DM);    break;
-	    case 0x63: strcpy (desc, "U frame UA");    return (frame_type_UA);    break;
-	    case 0x87: strcpy (desc, "U frame FRMR");  return (frame_type_FRMR);  break;
-	    case 0x03: strcpy (desc, "U frame UI");    return (frame_type_UI);    break;
-	    case 0xaf: strcpy (desc, "U frame XID");   return (frame_type_XID);   break;
-	    case 0xe3: strcpy (desc, "U frame TEST");  return (frame_type_TEST);  break;
-	    default:   strcpy (desc, "U frame ???");   return (frame_type_U);     break;
+	    case 0x6f: snprintf (desc, DESC_SIZ, "SABME %s, %s=%d",	cr_text, pf_text, *pf);  return (frame_type_U_SABME); break;
+	    case 0x2f: snprintf (desc, DESC_SIZ, "SABM %s, %s=%d", 	cr_text, pf_text, *pf);  return (frame_type_U_SABM);  break;
+	    case 0x43: snprintf (desc, DESC_SIZ, "DISC %s, %s=%d", 	cr_text, pf_text, *pf);  return (frame_type_U_DISC);  break;
+	    case 0x0f: snprintf (desc, DESC_SIZ, "DM %s, %s=%d", 	cr_text, pf_text, *pf);  return (frame_type_U_DM);    break;
+	    case 0x63: snprintf (desc, DESC_SIZ, "UA %s, %s=%d", 	cr_text, pf_text, *pf);  return (frame_type_U_UA);    break;
+	    case 0x87: snprintf (desc, DESC_SIZ, "FRMR %s, %s=%d", 	cr_text, pf_text, *pf);  return (frame_type_U_FRMR);  break;
+	    case 0x03: snprintf (desc, DESC_SIZ, "UI %s, %s=%d", 	cr_text, pf_text, *pf);  return (frame_type_U_UI);    break;
+	    case 0xaf: snprintf (desc, DESC_SIZ, "XID %s, %s=%d", 	cr_text, pf_text, *pf);  return (frame_type_U_XID);   break;
+	    case 0xe3: snprintf (desc, DESC_SIZ, "TEST %s, %s=%d", 	cr_text, pf_text, *pf);  return (frame_type_U_TEST);  break;
+	    default:   snprintf (desc, DESC_SIZ, "U other???");        				 return (frame_type_U);       break;
 	  }
 	}
 
 	// Should be unreachable but compiler doesn't realize that.
-	// Suppress "warning: control reaches end of non-void function"
+	// Here only to suppress "warning: control reaches end of non-void function"
 
 	return (frame_not_AX25);
 
 } /* end ax25_frame_type */
+
+
 
 /*------------------------------------------------------------------
  *
@@ -1716,50 +2221,53 @@ static void hex_dump (unsigned char *p, int len)
 }
 
 /* Text description of control octet. */
+// FIXME:  this is wrong.  It doesn't handle modulo 128.
 
 // TODO: use ax25_frame_type() instead.
 
-static void ctrl_to_text (int c, char *out)
+static void ctrl_to_text (int c, char *out, size_t outsiz)
 {
-	if      ((c & 1) == 0)       { sprintf (out, "I frame: n(r)=%d, p=%d, n(s)=%d",  (c>>5)&7, (c>>4)&1, (c>>1)&7); }
-	else if ((c & 0xf) == 0x01)  { sprintf (out, "S frame RR: n(r)=%d, p/f=%d",  (c>>5)&7, (c>>4)&1); }
-	else if ((c & 0xf) == 0x05)  { sprintf (out, "S frame RNR: n(r)=%d, p/f=%d",  (c>>5)&7, (c>>4)&1); }
-	else if ((c & 0xf) == 0x09)  { sprintf (out, "S frame REJ: n(r)=%d, p/f=%d",  (c>>5)&7, (c>>4)&1); }
-	else if ((c & 0xf) == 0x0D)  { sprintf (out, "S frame sREJ: n(r)=%d, p/f=%d",  (c>>5)&7, (c>>4)&1); }
-	else if ((c & 0xef) == 0x6f) { sprintf (out, "U frame SABME: p=%d", (c>>4)&1); }
-	else if ((c & 0xef) == 0x2f) { sprintf (out, "U frame SABM: p=%d", (c>>4)&1); }
-	else if ((c & 0xef) == 0x43) { sprintf (out, "U frame DISC: p=%d", (c>>4)&1); }
-	else if ((c & 0xef) == 0x0f) { sprintf (out, "U frame DM: f=%d", (c>>4)&1); }
-	else if ((c & 0xef) == 0x63) { sprintf (out, "U frame UA: f=%d", (c>>4)&1); }
-	else if ((c & 0xef) == 0x87) { sprintf (out, "U frame FRMR: f=%d", (c>>4)&1); }
-	else if ((c & 0xef) == 0x03) { sprintf (out, "U frame UI: p/f=%d", (c>>4)&1); }
-	else if ((c & 0xef) == 0xAF) { sprintf (out, "U frame XID: p/f=%d", (c>>4)&1); }
-	else if ((c & 0xef) == 0xe3) { sprintf (out, "U frame TEST: p/f=%d", (c>>4)&1); }
-	else                         { sprintf (out, "Unknown frame type for control = 0x%02x", c); }
+	if      ((c & 1) == 0)       { snprintf (out, outsiz, "I frame: n(r)=%d, p=%d, n(s)=%d",  (c>>5)&7, (c>>4)&1, (c>>1)&7); }
+	else if ((c & 0xf) == 0x01)  { snprintf (out, outsiz, "S frame RR: n(r)=%d, p/f=%d",  (c>>5)&7, (c>>4)&1); }
+	else if ((c & 0xf) == 0x05)  { snprintf (out, outsiz, "S frame RNR: n(r)=%d, p/f=%d",  (c>>5)&7, (c>>4)&1); }
+	else if ((c & 0xf) == 0x09)  { snprintf (out, outsiz, "S frame REJ: n(r)=%d, p/f=%d",  (c>>5)&7, (c>>4)&1); }
+	else if ((c & 0xf) == 0x0D)  { snprintf (out, outsiz, "S frame sREJ: n(r)=%d, p/f=%d",  (c>>5)&7, (c>>4)&1); }
+	else if ((c & 0xef) == 0x6f) { snprintf (out, outsiz, "U frame SABME: p=%d", (c>>4)&1); }
+	else if ((c & 0xef) == 0x2f) { snprintf (out, outsiz, "U frame SABM: p=%d", (c>>4)&1); }
+	else if ((c & 0xef) == 0x43) { snprintf (out, outsiz, "U frame DISC: p=%d", (c>>4)&1); }
+	else if ((c & 0xef) == 0x0f) { snprintf (out, outsiz, "U frame DM: f=%d", (c>>4)&1); }
+	else if ((c & 0xef) == 0x63) { snprintf (out, outsiz, "U frame UA: f=%d", (c>>4)&1); }
+	else if ((c & 0xef) == 0x87) { snprintf (out, outsiz, "U frame FRMR: f=%d", (c>>4)&1); }
+	else if ((c & 0xef) == 0x03) { snprintf (out, outsiz, "U frame UI: p/f=%d", (c>>4)&1); }
+	else if ((c & 0xef) == 0xAF) { snprintf (out, outsiz, "U frame XID: p/f=%d", (c>>4)&1); }
+	else if ((c & 0xef) == 0xe3) { snprintf (out, outsiz, "U frame TEST: p/f=%d", (c>>4)&1); }
+	else                         { snprintf (out, outsiz, "Unknown frame type for control = 0x%02x", c); }
 }
 
 /* Text description of protocol id octet. */
 
-static void pid_to_text (int p, char *out)
+#define PID_TEXT_SIZE 80
+
+static void pid_to_text (int p, char out[PID_TEXT_SIZE])
 {
 
-	if      ((p & 0x30) == 0x10) { sprintf (out, "AX.25 layer 3 implemented."); }
-	else if ((p & 0x30) == 0x20) { sprintf (out, "AX.25 layer 3 implemented."); }
-	else if (p == 0x01)          { sprintf (out, "ISO 8208/CCITT X.25 PLP"); }
-	else if (p == 0x06)          { sprintf (out, "Compressed TCP/IP packet. Van Jacobson (RFC 1144)"); }
-	else if (p == 0x07)          { sprintf (out, "Uncompressed TCP/IP packet. Van Jacobson (RFC 1144)"); }
-	else if (p == 0x08)          { sprintf (out, "Segmentation fragment"); }
-	else if (p == 0xC3)          { sprintf (out, "TEXNET datagram protocol"); }
-	else if (p == 0xC4)          { sprintf (out, "Link Quality Protocol"); }
-	else if (p == 0xCA)          { sprintf (out, "Appletalk"); }
-	else if (p == 0xCB)          { sprintf (out, "Appletalk ARP"); }
-	else if (p == 0xCC)          { sprintf (out, "ARPA Internet Protocol"); }
-	else if (p == 0xCD)          { sprintf (out, "ARPA Address resolution"); }
-	else if (p == 0xCE)          { sprintf (out, "FlexNet"); }
-	else if (p == 0xCF)          { sprintf (out, "NET/ROM"); }
-	else if (p == 0xF0)          { sprintf (out, "No layer 3 protocol implemented."); }
-	else if (p == 0xFF)          { sprintf (out, "Escape character. Next octet contains more Level 3 protocol information."); }
-	else                         { sprintf (out, "Unknown protocol id = 0x%02x", p); }
+	if      ((p & 0x30) == 0x10) { snprintf (out, PID_TEXT_SIZE, "AX.25 layer 3 implemented."); }
+	else if ((p & 0x30) == 0x20) { snprintf (out, PID_TEXT_SIZE, "AX.25 layer 3 implemented."); }
+	else if (p == 0x01)          { snprintf (out, PID_TEXT_SIZE, "ISO 8208/CCITT X.25 PLP"); }
+	else if (p == 0x06)          { snprintf (out, PID_TEXT_SIZE, "Compressed TCP/IP packet. Van Jacobson (RFC 1144)"); }
+	else if (p == 0x07)          { snprintf (out, PID_TEXT_SIZE, "Uncompressed TCP/IP packet. Van Jacobson (RFC 1144)"); }
+	else if (p == 0x08)          { snprintf (out, PID_TEXT_SIZE, "Segmentation fragment"); }
+	else if (p == 0xC3)          { snprintf (out, PID_TEXT_SIZE, "TEXNET datagram protocol"); }
+	else if (p == 0xC4)          { snprintf (out, PID_TEXT_SIZE, "Link Quality Protocol"); }
+	else if (p == 0xCA)          { snprintf (out, PID_TEXT_SIZE, "Appletalk"); }
+	else if (p == 0xCB)          { snprintf (out, PID_TEXT_SIZE, "Appletalk ARP"); }
+	else if (p == 0xCC)          { snprintf (out, PID_TEXT_SIZE, "ARPA Internet Protocol"); }
+	else if (p == 0xCD)          { snprintf (out, PID_TEXT_SIZE, "ARPA Address resolution"); }
+	else if (p == 0xCE)          { snprintf (out, PID_TEXT_SIZE, "FlexNet"); }
+	else if (p == 0xCF)          { snprintf (out, PID_TEXT_SIZE, "NET/ROM"); }
+	else if (p == 0xF0)          { snprintf (out, PID_TEXT_SIZE, "No layer 3 protocol implemented."); }
+	else if (p == 0xFF)          { snprintf (out, PID_TEXT_SIZE, "Escape character. Next octet contains more Level 3 protocol information."); }
+	else                         { snprintf (out, PID_TEXT_SIZE, "Unknown protocol id = 0x%02x", p); }
 }
 
 
@@ -1780,22 +2288,22 @@ void ax25_hex_dump (packet_t this_p)
 	  c = fptr[this_p->num_addr*7];
 	  p = fptr[this_p->num_addr*7+1];
 
-	  ctrl_to_text (c, cp_text); // TODO: use ax25_frame_type() instead.
+	  ctrl_to_text (c, cp_text, sizeof(cp_text)); // TODO: use ax25_frame_type() instead.
 
 	  if ( (c & 0x01) == 0 ||				/* I   xxxx xxx0 */
 	     	c == 0x03 || c == 0x13) {			/* UI  000x 0011 */
 
-	    char p_text[100];
+	    char pid_text[PID_TEXT_SIZE];
 
-	    pid_to_text (p, p_text);
+	    pid_to_text (p, pid_text);
 
-	    strcat (cp_text, ", ");
-	    strcat (cp_text, p_text);
+	    strlcat (cp_text, ", ", sizeof(cp_text));
+	    strlcat (cp_text, pid_text, sizeof(cp_text));
 
 	  }
 
-	  sprintf (l_text, ", length = %d", flen);
-	  strcat (cp_text, l_text);
+	  snprintf (l_text, sizeof(l_text), ", length = %d", flen);
+	  strlcat (cp_text, l_text, sizeof(cp_text));
 
 	  dw_printf ("%s\n", cp_text);
 	}
@@ -1862,10 +2370,12 @@ int ax25_is_aprs (packet_t this_p)
 	assert (this_p->magic1 == MAGIC);
 	assert (this_p->magic2 == MAGIC);
 
+	if (this_p->frame_len == 0) return(0);
+
 	ctrl = ax25_get_control(this_p);
 	pid = ax25_get_pid(this_p);
 
-	is_aprs = this_p->num_addr >= 2 && ctrl == AX25_UI_FRAME && pid == AX25_NO_LAYER_3;
+	is_aprs = this_p->num_addr >= 2 && ctrl == AX25_UI_FRAME && pid == AX25_PID_NO_LAYER_3;
 
 #if 0 
         text_color_set(DW_COLOR_ERROR);
@@ -1873,6 +2383,41 @@ int ax25_is_aprs (packet_t this_p)
 #endif
 	return (is_aprs);
 }
+
+
+/*------------------------------------------------------------------
+ *
+ * Function:	ax25_is_null_frame
+ *
+ * Purpose:	Is this packet structure empty?
+ *
+ * Inputs:	this_p	- pointer to packet object.
+ *
+ * Returns:	True if frame data length is 0.
+ *
+ * Description:	This is used when we want to wake up the
+ *		transmit queue processing thread but don't
+ *		want to transmit a frame.
+ *
+ *------------------------------------------------------------------*/
+
+
+int ax25_is_null_frame (packet_t this_p)
+{
+	int is_null;
+
+	assert (this_p->magic1 == MAGIC);
+	assert (this_p->magic2 == MAGIC);
+
+	is_null = this_p->frame_len == 0;
+
+#if 0
+        text_color_set(DW_COLOR_ERROR);
+        dw_printf ("ax25_is_null_frame(): is_null=%d\n", is_null);
+#endif
+	return (is_null);
+}
+
 
 /*------------------------------------------------------------------
  *
@@ -1894,6 +2439,8 @@ int ax25_get_control (packet_t this_p)
 	assert (this_p->magic1 == MAGIC);
 	assert (this_p->magic2 == MAGIC);
 
+	if (this_p->frame_len == 0) return(-1);
+
 	if (this_p->num_addr >= 2) {
 	  return (this_p->frame_data[ax25_get_control_offset(this_p)]);
 	}
@@ -1905,10 +2452,19 @@ int ax25_get_c2 (packet_t this_p)
 	assert (this_p->magic1 == MAGIC);
 	assert (this_p->magic2 == MAGIC);
 
+	if (this_p->frame_len == 0) return(-1);
+
 	if (this_p->num_addr >= 2) {
-	  return (this_p->frame_data[ax25_get_control_offset(this_p)+1]);
+	  int offset2 = ax25_get_control_offset(this_p)+1;
+
+	  if (offset2 < this_p->frame_len) {
+	    return (this_p->frame_data[offset2]);
+	  }
+	  else {
+	    return (-1);	/* attempt to go beyond the end of frame. */
+	  }
 	}
-	return (-1);
+	return (-1);		/* not AX.25 */
 }
 
 
@@ -1938,11 +2494,40 @@ int ax25_get_pid (packet_t this_p)
 	// TODO: handle 2 control byte case.
 	// TODO: sanity check: is it I or UI frame?
 
+	if (this_p->frame_len == 0) return(-1);
+
 	if (this_p->num_addr >= 2) {
 	  return (this_p->frame_data[ax25_get_pid_offset(this_p)]);
 	}
 	return (-1);
 }
+
+
+
+/*------------------------------------------------------------------
+ *
+ * Function:	ax25_get_frame_len
+ *
+ * Purpose:	Get length of frame.
+ *
+ * Inputs:	this_p	- pointer to packet object.
+ *		
+ * Returns:	Number of octets in the frame buffer.  
+ *		Does NOT include the extra 2 for FCS.
+ *
+ *------------------------------------------------------------------*/
+
+int ax25_get_frame_len (packet_t this_p) 
+{
+	assert (this_p->magic1 == MAGIC);
+	assert (this_p->magic2 == MAGIC);
+
+	assert (this_p->frame_len >= 0 && this_p->frame_len <= AX25_MAX_PACKET_LEN);
+
+	return (this_p->frame_len);
+
+} /* end ax25_get_frame_len */
+
 
 
 /*------------------------------------------------------------------------------
@@ -1970,6 +2555,27 @@ int ax25_get_pid (packet_t this_p)
  *		There is a very very small probability that two unrelated 
  *		packets will result in the same checksum, and the
  *		undesired dropping of the packet.
+ *
+ *		There is a 1 / 65536 chance of getting a false positive match
+ *		which is good enough for this application.
+ *		We could reduce that with a 32 bit CRC instead of reusing
+ *		code from the AX.25 frame CRC calculation.
+ *
+ * Version 1.3:	We exclude any trailing CR/LF at the end of the info part
+ *		so we can detect duplicates that are received only over the
+ *		air and those which have gone thru an IGate where the process
+ *		removes any trailing CR/LF.   Example:
+ *
+ *		Original via RF only:
+ *		W1TG-1>APU25N,N3LEE-10*,WIDE2-1:<IGATE,MSG_CNT=30,LOC_CNT=61<0x0d>
+ *
+ *		When we get the same thing via APRS-IS:
+ *		W1TG-1>APU25N,K1FFK,WIDE2*,qAR,WB2ZII-15:<IGATE,MSG_CNT=30,LOC_CNT=61
+ *
+ *		(Actually there is a trailing space.  Maybe some systems
+ *		change control characters to space???)
+ *		Hmmmm.  I guess we should ignore trailing space as well for 
+ *		duplicate detection and suppression.
  *		
  *------------------------------------------------------------------------------*/
 
@@ -1984,6 +2590,20 @@ unsigned short ax25_dedupe_crc (packet_t pp)
 	ax25_get_addr_with_ssid(pp, AX25_SOURCE, src);
 	ax25_get_addr_with_ssid(pp, AX25_DESTINATION, dest);
 	info_len = ax25_get_info (pp, &pinfo);
+
+	while (info_len >= 1 && (pinfo[info_len-1] == '\r' ||
+	                         pinfo[info_len-1] == '\n' ||
+	                         pinfo[info_len-1] == ' ')) {
+
+	// Temporary for debugging!
+
+	//  if (pinfo[info_len-1] == ' ') {
+	//    text_color_set(DW_COLOR_ERROR);
+	//    dw_printf ("DEBUG:  ax25_dedupe_crc ignoring trailing space.\n");
+	//  }
+
+	  info_len--;
+	}
 
 	crc = 0xffff;
 	crc = crc16((unsigned char *)src, strlen(src), crc);
@@ -2040,7 +2660,7 @@ unsigned short ax25_m_m_crc (packet_t pp)
  *
  * Inputs:	pstr	- Pointer to string.
  *
- *		len	- Maximum length if not -1.
+ *		len	- Number of bytes.  If < 0 we use strlen().
  *
  *		ascii_only	- Restrict output to only ASCII.
  *				  Normally we allow UTF-8.
@@ -2065,6 +2685,11 @@ unsigned short ax25_m_m_crc (packet_t pp)
  *		as hexadecimal for troubleshooting? Maybe an option so the
  *		packet raw data is in hexadecimal but an extracted 
  *		comment displays UTF-8?  Or a command line option for only ASCII?
+ *
+ * Trailing space:
+ *		I recently noticed a case where a packet has space character
+ *		at the end.  If the last character of the line is a space,
+ *		this will be displayed in hexadecimal to make it obvious.
  *			
  *------------------------------------------------------------------*/
 
@@ -2086,19 +2711,24 @@ void ax25_safe_print (char *pstr, int len, int ascii_only)
 	if (len > MAXSAFE)
 	  len = MAXSAFE;
 
-	while (len > 0 && *pstr != '\0')
+	while (len > 0)
 	{
 	  ch = *((unsigned char *)pstr);
 
-	  if (ch < ' ' || ch == 0x7f || ch == 0xfe || ch == 0xff ||
+	  if (ch == ' ' && (len == 1 || pstr[1] == '\0')) {
+
+	      snprintf (safe_str + safe_len, sizeof(safe_str)-safe_len, "<0x%02x>", ch);
+	      safe_len += 6;
+	  }
+	  else if (ch < ' ' || ch == 0x7f || ch == 0xfe || ch == 0xff ||
 			(ascii_only && ch >= 0x80) ) {
 
 	      /* Control codes and delete. */
 	      /* UTF-8 does not use fe and ff except in a possible */
 	      /* "Byte Order Mark" (BOM) at the beginning. */
 
-	      sprintf (safe_str + safe_len, "<0x%02x>", ch);
-	      safe_len += 6;	      
+	      snprintf (safe_str + safe_len, sizeof(safe_str)-safe_len, "<0x%02x>", ch);
+	      safe_len += 6;
 	    }
 	  else {
 	    /* Let everything else thru so we can handle UTF-8 */
@@ -2138,6 +2768,8 @@ void ax25_safe_print (char *pstr, int len, int ascii_only)
  *			  Comma is to be avoided because one place this 
  *			  ends up is in a CSV format file.
  *
+ *			  size should be AX25_ALEVEL_TO_TEXT_SIZE.
+ *
  * Returns:	True if something to print.  (currently if alevel.original >= 0)
  *		False if not.
  *
@@ -2153,25 +2785,34 @@ void ax25_safe_print (char *pstr, int len, int ascii_only)
  *------------------------------------------------------------------*/
 
 
-int ax25_alevel_to_text (alevel_t alevel, char *text)
+int ax25_alevel_to_text (alevel_t alevel, char text[AX25_ALEVEL_TO_TEXT_SIZE])
 {
 	if (alevel.rec < 0) {
-	  strcpy (text, "");
+	  strlcpy (text, "", AX25_ALEVEL_TO_TEXT_SIZE);
 	  return (0);
 	}
 
 // TODO1.2: haven't thought much about non-AFSK cases yet.
 // What should we do for 9600 baud?
-// Possibility: low/high tone for DTMF???
+
+// For DTMF omit the two extra numbers.
 
 	if (alevel.mark >= 0 &&  alevel.space < 0) {		/* baseband */
 
-	  sprintf (text, "%d(%+d/%+d)", alevel.rec, alevel.mark, alevel.space);
+	  snprintf (text, AX25_ALEVEL_TO_TEXT_SIZE, "%d(%+d/%+d)", alevel.rec, alevel.mark, alevel.space);
+	}
+	else if (alevel.mark == -1 &&  alevel.space == -1) {		/* PSK - single number. */
+
+	  snprintf (text, AX25_ALEVEL_TO_TEXT_SIZE, "%d", alevel.rec);
+	}
+	else if (alevel.mark == -2 &&  alevel.space == -2) {		/* DTMF - single number. */
+
+	  snprintf (text, AX25_ALEVEL_TO_TEXT_SIZE, "%d", alevel.rec);
 	}
 	else {		/* AFSK */
 
-	  //sprintf (text, "%d:%d(%d/%d=%05.3f=)", alevel.original, alevel.rec, alevel.mark, alevel.space, alevel.ms_ratio);
-	  sprintf (text, "%d(%d/%d)", alevel.rec, alevel.mark, alevel.space);
+	  //snprintf (text, AX25_ALEVEL_TO_TEXT_SIZE, "%d:%d(%d/%d=%05.3f=)", alevel.original, alevel.rec, alevel.mark, alevel.space, alevel.ms_ratio);
+	  snprintf (text, AX25_ALEVEL_TO_TEXT_SIZE, "%d(%d/%d)", alevel.rec, alevel.mark, alevel.space);
 	}
 	return (1);	
 

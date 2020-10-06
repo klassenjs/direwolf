@@ -1,12 +1,12 @@
 /* UTM to Latitude / Longitude conversion */
 
+#include "direwolf.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
 #include <ctype.h>
-
 
 #include "utm.h"
 #include "mgrs.h"
@@ -40,7 +40,7 @@ int main (int argc, char *argv[])
 
 // 3 command line arguments for UTM
 
-	  strcpy (szone, argv[1]);
+	  strlcpy (szone, argv[1], sizeof(szone));
 	  lzone = strtoul(szone, &zlet, 10);
 
 	  if (*zlet == '\0') {

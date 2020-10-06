@@ -1,7 +1,35 @@
 
+/* direwolf.h - Common stuff used many places. */
+
+// TODO:   include this file first before anything else in each .c file.
+
+
 #ifndef DIREWOLF_H
 #define DIREWOLF_H 1
 
+/*
+ * Support Windows XP and later.
+ *
+ * We need this before "#include <ws2tcpip.h>".
+ *
+ * Don't know what other impact it might have on others.
+ */
+
+#if __WIN32__
+
+#ifdef _WIN32_WINNT
+#error	Include "direwolf.h" before any windows system files.
+#endif
+#ifdef WINVER
+#error	Include "direwolf.h" before any windows system files.
+#endif
+
+#define _WIN32_WINNT 0x0501     /* Minimum OS version is XP. */
+#define WINVER       0x0501     /* Minimum OS version is XP. */
+
+#include <windows.h>
+
+#endif
 
 
 /*
@@ -10,6 +38,8 @@
  * In version 1.2, we relax this restriction and allow more audio devices.
  * Three is probably adequate for standard version.
  * Larger reasonable numbers should also be fine.
+ *
+ * For example, if you wanted to use 4 audio devices at once, change this to 4.
  */
 
 #define MAX_ADEVS 3			
@@ -32,6 +62,14 @@
 #define MAX_CHANS ((MAX_ADEVS) * 2)
 
 /*
+ * Maximum number of rigs.
+ */
+
+#ifdef USE_HAMLIB
+#define MAX_RIGS MAX_CHANS
+#endif
+
+/*
  * Get audio device number for given channel.
  * and first channel for given device.
  */
@@ -49,9 +87,19 @@
 
 #define MAX_SUBCHANS 9
 
+/*
+ * Each one of these can have multiple slicers, at
+ * different levels, to compensate for different
+ * amplitudes of the AFSK tones.
+ * Intially used same number as subchannels but
+ * we could probably trim this down a little
+ * without impacting performance.
+ */
+
+#define MAX_SLICERS 9
+
 
 #if __WIN32__
-#include <windows.h>
 #define SLEEP_SEC(n) Sleep((n)*1000)
 #define SLEEP_MS(n) Sleep(n)
 #else
@@ -62,15 +110,59 @@
 
 #if __WIN32__
 #define PTW32_STATIC_LIB
-#include "pthreads/pthread.h"
+//#include "pthreads/pthread.h"
+#define gmtime_r( _clock, _result ) \
+        ( *(_result) = *gmtime( (_clock) ), \
+          (_result) )
 #else
 #include <pthread.h>
+#endif
+
+
+#ifdef __APPLE__
+
+// https://groups.yahoo.com/neo/groups/direwolf_packet/conversations/messages/2072
+
+// The original suggestion was to add this to only ptt.c.
+// I thought it would make sense to put it here, so it will apply to all files,
+// consistently, rather than only one file ptt.c.
+
+// The placement of this is critical.  Putting it earlier was a problem.
+// https://github.com/wb2osz/direwolf/issues/113
+
+// It needs to be after the include pthread.h because
+// pthread.h pulls in <sys/cdefs.h>, which redefines __DARWIN_C_LEVEL back to ansi,
+// which breaks things.
+// Maybe it should just go in ptt.c as originally suggested.
+
+// #define __DARWIN_C_LEVEL  __DARWIN_C_FULL
+
+// There is a more involved patch here:
+//  https://groups.yahoo.com/neo/groups/direwolf_packet/conversations/messages/2458
+
+#ifndef _DARWIN_C_SOURCE
+#define _DARWIN_C_SOURCE
+#endif
+
+// Defining _DARWIN_C_SOURCE ensures that the definition for the cfmakeraw function (or similar)
+// are pulled in through the include file <sys/termios.h>.
+
+#ifdef __DARWIN_C_LEVEL
+#undef __DARWIN_C_LEVEL
+#endif
+
+#define __DARWIN_C_LEVEL  __DARWIN_C_FULL
+
 #endif
 
 
 /* Not sure where to put these. */
 
 /* Prefix with DW_ because /usr/include/gps.h uses a couple of these names. */
+
+#ifndef G_UNKNOWN
+#include "latlong.h"
+#endif
 
 
 #define DW_METERS_TO_FEET(x) ((x) == G_UNKNOWN ? G_UNKNOWN : (x) * 3.2808399)
@@ -153,9 +245,68 @@ typedef pthread_mutex_t dw_mutex_t;
 	  } \
 	}
 
-
 #endif
 
+
+
+// Formerly used write/read on Linux, for some forgotten reason,
+// but always using send/recv makes more sense.
+// Need option to prevent a SIGPIPE signal on Linux.  (added for 1.5 beta 2)
+
+#if __WIN32__ || __APPLE__
+#define SOCK_SEND(s,data,size) send(s,data,size,0)
+#else
+#define SOCK_SEND(s,data,size) send(s,data,size, MSG_NOSIGNAL)
+#endif
+#define SOCK_RECV(s,data,size) recv(s,data,size,0)
+
+
+/* Platform differences for string functions. */
+
+
+
+#if __WIN32__
+char *strsep(char **stringp, const char *delim);
+char *strtok_r(char *str, const char *delim, char **saveptr);
+#endif
+
+// Don't recall why for everyone.
+char *strcasestr(const char *S, const char *FIND);
+
+
+#if defined(__OpenBSD__) || defined(__FreeBSD__) || defined(__APPLE__)
+
+// strlcpy and strlcat should be in string.h and the C library.
+
+#else   // Use our own copy
+
+
+// These prevent /usr/include/gps.h from providing its own definition.
+#define HAVE_STRLCAT 1
+#define HAVE_STRLCPY 1
+
+
+#define DEBUG_STRL 1
+
+#if DEBUG_STRL
+
+#define strlcpy(dst,src,siz) strlcpy_debug(dst,src,siz,__FILE__,__func__,__LINE__)
+#define strlcat(dst,src,siz) strlcat_debug(dst,src,siz,__FILE__,__func__,__LINE__)
+
+size_t strlcpy_debug(char *__restrict__ dst, const char *__restrict__ src, size_t siz, const char *file, const char *func, int line);
+size_t strlcat_debug(char *__restrict__ dst, const char *__restrict__ src, size_t siz, const char *file, const char *func, int line);
+
+#else
+
+#define strlcpy(dst,src,siz) strlcpy_debug(dst,src,siz)
+#define strlcat(dst,src,siz) strlcat_debug(dst,src,siz)
+
+size_t strlcpy_debug(char *__restrict__ dst, const char *__restrict__ src, size_t siz);
+size_t strlcat_debug(char *__restrict__ dst, const char *__restrict__ src, size_t siz);
+
+#endif  /* DEBUG_STRL */
+
+#endif	/* BSD or Apple */
 
 
 #endif   /* ifndef DIREWOLF_H */

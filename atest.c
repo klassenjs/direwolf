@@ -2,7 +2,7 @@
 //
 //    This file is part of Dire Wolf, an amateur radio packet TNC.
 //
-//    Copyright (C) 2011, 2012, 2013, 2014, 2015  John Langner, WB2OSZ
+//    Copyright (C) 2011, 2012, 2013, 2014, 2015, 2016  John Langner, WB2OSZ
 //
 //    This program is free software: you can redistribute it and/or modify
 //    it under the terms of the GNU General Public License as published by
@@ -59,6 +59,7 @@
 
 // #define X 1
 
+#include "direwolf.h"
 
 #include <stdio.h>
 #include <unistd.h>
@@ -79,6 +80,7 @@
 #include "hdlc_rec2.h"
 #include "dlq.h"
 #include "ptt.h"
+#include "dtime_now.h"
 
 
 
@@ -141,7 +143,11 @@ static int decimate = 0;		/* Reduce that sampling rate if set. */
 
 static struct audio_s my_audio_config;
 
-static int error_if_less_than = 0;	/* Exit with error status if this minimum not reached. */
+static int error_if_less_than = -1;	/* Exit with error status if this minimum not reached. */
+					/* Can be used to check that performance has not decreased. */
+
+static int error_if_greater_than = -1;	/* Exit with error status if this maximum exceeded. */
+					/* Can be used to check that duplicate removal is not broken. */
 
 
 
@@ -161,6 +167,12 @@ extern float space_gain[MAX_SUBCHANS];
 static void usage (void);
 
 
+static int decode_only = 0;		/* Set to 0 or 1 to decode only one channel.  2 for both.  */
+
+static int sample_number = -1;		/* Sample number from the file. */
+					/* Incremented only for channel 0. */
+					/* Use to print timestamp, relative to beginning */
+					/* of file, when frame was decoded. */
 
 int main (int argc, char *argv[])
 {
@@ -168,8 +180,10 @@ int main (int argc, char *argv[])
 	int err;
 	int c;
 	int channel;
-	time_t start_time;
 
+	double start_time;		// Time when we started so we can measure elapsed time.
+	double duration;		// Length of the audio file in seconds.
+	double elapsed;			// Time it took us to process it.
 
 
 #if defined(EXPERIMENT_G) || defined(EXPERIMENT_H)
@@ -245,7 +259,7 @@ int main (int argc, char *argv[])
 	  my_audio_config.achan[channel].space_freq = DEFAULT_SPACE_FREQ;		
 	  my_audio_config.achan[channel].baud = DEFAULT_BAUD;	
 
-	  strcpy (my_audio_config.achan[channel].profiles, "E");	
+	  strlcpy (my_audio_config.achan[channel].profiles, "E", sizeof(my_audio_config.achan[channel].profiles));
  		
 	  my_audio_config.achan[channel].num_freq = 1;				
 	  my_audio_config.achan[channel].offset = 0;	
@@ -261,7 +275,7 @@ int main (int argc, char *argv[])
 	}
 
 	while (1) {
-          int this_option_optind = optind ? optind : 1;
+          //int this_option_optind = optind ? optind : 1;
           int option_index = 0;
           static struct option long_options[] = {
             {"future1", 1, 0, 0},
@@ -272,7 +286,7 @@ int main (int argc, char *argv[])
 
 	  /* ':' following option character means arg is required. */
 
-          c = getopt_long(argc, argv, "B:P:D:F:e:",
+          c = getopt_long(argc, argv, "B:P:D:F:L:G:012",
                         long_options, &option_index);
           if (c == -1)
             break;
@@ -282,40 +296,67 @@ int main (int argc, char *argv[])
             case 'B':				/* -B for data Bit rate */
 						/*    300 implies 1600/1800 AFSK. */
 						/*    1200 implies 1200/2200 AFSK. */
+						/*    2400 implies V.26 */
 						/*    9600 implies scrambled. */
 
               my_audio_config.achan[0].baud = atoi(optarg);
 
               dw_printf ("Data rate set to %d bits / second.\n", my_audio_config.achan[0].baud);
 
-              if (my_audio_config.achan[0].baud < 100 || my_audio_config.achan[0].baud > 10000) {
+              if (my_audio_config.achan[0].baud < MIN_BAUD || my_audio_config.achan[0].baud > MAX_BAUD) {
 		text_color_set(DW_COLOR_ERROR);
-                dw_printf ("Use a more reasonable bit rate in range of 100 - 10000.\n");
+                dw_printf ("Use a more reasonable bit rate in range of %d - %d.\n", MIN_BAUD, MAX_BAUD);
                 exit (EXIT_FAILURE);
               }
-	      if (my_audio_config.achan[0].baud < 600) {
+
+	      /* We have similar logic in direwolf.c, config.c, gen_packets.c, and atest.c, */
+	      /* that need to be kept in sync.  Maybe it could be a common function someday. */
+
+	      if (my_audio_config.achan[0].baud == 100) {
+                my_audio_config.achan[0].modem_type = MODEM_AFSK;
+                my_audio_config.achan[0].mark_freq = 1615;
+                my_audio_config.achan[0].space_freq = 1785;
+	        strlcpy (my_audio_config.achan[0].profiles, "D", sizeof(my_audio_config.achan[0].profiles));
+	      }
+	      else if (my_audio_config.achan[0].baud < 600) {
                 my_audio_config.achan[0].modem_type = MODEM_AFSK;
                 my_audio_config.achan[0].mark_freq = 1600;
                 my_audio_config.achan[0].space_freq = 1800;
-	        strcpy (my_audio_config.achan[0].profiles, "D");	      }
-	      else if (my_audio_config.achan[0].baud > 2400) {
+	        strlcpy (my_audio_config.achan[0].profiles, "D", sizeof(my_audio_config.achan[0].profiles));
+	      }
+	      else if (my_audio_config.achan[0].baud < 1800) {
+                my_audio_config.achan[0].modem_type = MODEM_AFSK;
+                my_audio_config.achan[0].mark_freq = DEFAULT_MARK_FREQ;
+                my_audio_config.achan[0].space_freq = DEFAULT_SPACE_FREQ;
+		// Should default to E+ or something similar later.
+	      }
+	      else if (my_audio_config.achan[0].baud < 3600) {
+                my_audio_config.achan[0].modem_type = MODEM_QPSK;
+                my_audio_config.achan[0].mark_freq = 0;
+                my_audio_config.achan[0].space_freq = 0;
+	        strlcpy (my_audio_config.achan[0].profiles, "", sizeof(my_audio_config.achan[0].profiles));
+                dw_printf ("Using V.26 QPSK rather than AFSK.\n");
+	      }
+	      else if (my_audio_config.achan[0].baud < 7200) {
+                my_audio_config.achan[0].modem_type = MODEM_8PSK;
+                my_audio_config.achan[0].mark_freq = 0;
+                my_audio_config.achan[0].space_freq = 0;
+	        strlcpy (my_audio_config.achan[0].profiles, "", sizeof(my_audio_config.achan[0].profiles));
+                dw_printf ("Using V.27 8PSK rather than AFSK.\n");
+	      }
+	      else {
                 my_audio_config.achan[0].modem_type = MODEM_SCRAMBLE;
                 my_audio_config.achan[0].mark_freq = 0;
                 my_audio_config.achan[0].space_freq = 0;
-	        strcpy (my_audio_config.achan[0].profiles, " ");	// avoid getting default later.
+	        strlcpy (my_audio_config.achan[0].profiles, " ", sizeof(my_audio_config.achan[0].profiles));	// avoid getting default later.
                 dw_printf ("Using scrambled baseband signal rather than AFSK.\n");
-	      }
-	      else {
-                my_audio_config.achan[0].modem_type = MODEM_AFSK;
-                my_audio_config.achan[0].mark_freq = 1200;
-                my_audio_config.achan[0].space_freq = 2200;
 	      }
               break;
 
 	    case 'P':				/* -P for modem profile. */
 
 	      dw_printf ("Demodulator profile set to \"%s\"\n", optarg);
-	      strcpy (my_audio_config.achan[0].profiles, optarg); 
+	      strlcpy (my_audio_config.achan[0].profiles, optarg, sizeof(my_audio_config.achan[0].profiles)); 
 	      break;	
 
 	    case 'D':				/* -D reduce sampling rate for lower CPU usage. */
@@ -326,7 +367,7 @@ int main (int argc, char *argv[])
 	      if (decimate < 1 || decimate > 8) {
 		text_color_set(DW_COLOR_ERROR);
 		dw_printf ("Unreasonable value for -D.\n");
-		exit (1);
+		exit (EXIT_FAILURE);
 	      }
 	      dw_printf ("Divide audio sample rate by %d\n", decimate);
 	      my_audio_config.achan[0].decimate = decimate;
@@ -339,14 +380,34 @@ int main (int argc, char *argv[])
 	      if (my_audio_config.achan[0].fix_bits < RETRY_NONE || my_audio_config.achan[0].fix_bits >= RETRY_MAX) {
 		text_color_set(DW_COLOR_ERROR);
 		dw_printf ("Invalid Fix Bits level.\n");
-		exit (1);
+		exit (EXIT_FAILURE);
 	      }
 	      break;	
 
-	    case 'e':				/* -e error if less than this number decoded. */
+	    case 'L':				/* -L error if less than this number decoded. */
 
 	      error_if_less_than = atoi(optarg);
 	      break;	
+
+	    case 'G':				/* -G error if greater than this number decoded. */
+
+	      error_if_greater_than = atoi(optarg);
+	      break;
+
+	     case '0':				/* channel 0, left from stereo */
+
+	       decode_only = 0;
+	       break;
+
+	     case '1':				/* channel 1, right from stereo */
+
+	       decode_only = 1;
+	       break;
+
+	     case '2':				/* decode both from stereo */
+
+	       decode_only = 2;
+	       break;
 
              case '?':
 
@@ -363,6 +424,9 @@ int main (int argc, char *argv[])
 	    }
         }
     
+	memcpy (&my_audio_config.achan[1], &my_audio_config.achan[0], sizeof(my_audio_config.achan[0]));
+
+
 	if (optind >= argc) {
 	  text_color_set(DW_COLOR_ERROR);
 	  dw_printf ("Specify .WAV file name on command line.\n");
@@ -374,11 +438,10 @@ int main (int argc, char *argv[])
 	  text_color_set(DW_COLOR_ERROR);
           dw_printf ("Couldn't open file for read: %s\n", argv[optind]);
 	  //perror ("more info?");
-          exit (1);
+          exit (EXIT_FAILURE);
         }
 
-	start_time = time(NULL);
-
+	start_time = dtime_now();
 
 /*
  * Read the file header.  
@@ -386,6 +449,7 @@ int main (int argc, char *argv[])
  */
 
         err= fread (&header, (size_t)12, (size_t)1, fp);
+	(void)(err);
 
 	if (strncmp(header.riff, "RIFF", 4) != 0 || strncmp(header.wave, "WAVE", 4) != 0) {
 	  text_color_set(DW_COLOR_ERROR);
@@ -403,12 +467,12 @@ int main (int argc, char *argv[])
 	if (strncmp(chunk.id, "fmt ", 4) != 0) {
 	  text_color_set(DW_COLOR_ERROR);
           dw_printf ("WAV file error: Found \"%4.4s\" where \"fmt \" was expected.\n", chunk.id);
-	  exit(1);
+	  exit(EXIT_FAILURE);
 	}
 	if (chunk.datasize != 16 && chunk.datasize != 18) {
 	  text_color_set(DW_COLOR_ERROR);
           dw_printf ("WAV file error: Need fmt chunk datasize of 16 or 18.  Found %d.\n", chunk.datasize);
-	  exit(1);
+	  exit(EXIT_FAILURE);
 	}
 
         err = fread (&format, (size_t)chunk.datasize, (size_t)1, fp);	
@@ -418,11 +482,26 @@ int main (int argc, char *argv[])
 	if (strncmp(wav_data.data, "data", 4) != 0) {
 	  text_color_set(DW_COLOR_ERROR);
           dw_printf ("WAV file error: Found \"%4.4s\" where \"data\" was expected.\n", wav_data.data);
-	  exit(1);
+	  exit(EXIT_FAILURE);
 	}
 
-	assert (format.nchannels == 1 || format.nchannels == 2);
-	assert (format.wbitspersample == 8 || format.wbitspersample == 16);
+	if (format.wformattag != 1) {
+	  text_color_set(DW_COLOR_ERROR);
+	  dw_printf ("Sorry, I only understand audio format 1 (PCM).  This file has %d.\n", format.wformattag);
+	  exit (EXIT_FAILURE);
+	}
+
+	if (format.nchannels != 1 && format.nchannels != 2) {
+	  text_color_set(DW_COLOR_ERROR);
+	  dw_printf ("Sorry, I only understand 1 or 2 channels.  This file has %d.\n", format.nchannels);
+	  exit (EXIT_FAILURE);
+	}
+
+	if (format.wbitspersample != 8 && format.wbitspersample != 16) {
+	  text_color_set(DW_COLOR_ERROR);
+	  dw_printf ("Sorry, I only understand 8 or 16 bits per sample.  This file has %d.\n", format.wbitspersample);
+	  exit (EXIT_FAILURE);
+	}
 
         my_audio_config.adev[0].samples_per_sec = format.nsamplespersec;
 	my_audio_config.adev[0].bits_per_sample = format.wbitspersample;
@@ -432,12 +511,16 @@ int main (int argc, char *argv[])
 	if (format.nchannels == 2) my_audio_config.achan[1].valid = 1;
 
 	text_color_set(DW_COLOR_INFO);
-	dw_printf ("%d samples per second\n", my_audio_config.adev[0].samples_per_sec);
-	dw_printf ("%d bits per sample\n", my_audio_config.adev[0].bits_per_sample);
-	dw_printf ("%d audio channels\n", my_audio_config.adev[0].num_channels);
-	dw_printf ("%d audio bytes in file\n", (int)(wav_data.datasize));
+	dw_printf ("%d samples per second.  %d bits per sample.  %d audio channels.\n",
+		my_audio_config.adev[0].samples_per_sec,
+		my_audio_config.adev[0].bits_per_sample,
+		my_audio_config.adev[0].num_channels);
+	duration = (double) wav_data.datasize /
+		((my_audio_config.adev[0].bits_per_sample / 8) * my_audio_config.adev[0].num_channels * my_audio_config.adev[0].samples_per_sec);
+	dw_printf ("%d audio bytes in file.  Duration = %.1f seconds.\n",
+		(int)(wav_data.datasize),
+		duration);
 	dw_printf ("Fix Bits level = %d\n", my_audio_config.achan[0].fix_bits);
-
 		
 /*
  * Initialize the AFSK demodulator and HDLC decoder.
@@ -461,14 +544,15 @@ int main (int argc, char *argv[])
 
             audio_sample = demod_get_sample (ACHAN2ADEV(c));
 
-            if (audio_sample >= 256 * 256)
-              e_o_f = 1;
+            if (audio_sample >= 256 * 256) {
+               e_o_f = 1;
+	       continue;
+	    }
 
-#define ONE_CHAN 1              /* only use one audio channel. */
+	    if (c == 0) sample_number++;
 
-#if ONE_CHAN
-            if (c != 0) continue;
-#endif
+            if (decode_only == 0 && c != 0) continue;
+            if (decode_only == 1 && c != 1) continue;
 
             multi_modem_process_sample(c,audio_sample);
           }
@@ -493,15 +577,24 @@ int main (int argc, char *argv[])
 	  dw_printf ("%d\n", count[j]);
 	}
 #endif
-	dw_printf ("%d packets decoded in %d seconds.\n", packets_decoded, (int)(time(NULL) - start_time));
 
-	if (packets_decoded < error_if_less_than) {
+
+	elapsed = dtime_now() - start_time;
+
+	dw_printf ("%d packets decoded in %.3f seconds.  %.1f x realtime\n", packets_decoded, elapsed, duration/elapsed);
+
+	if (error_if_less_than != -1 && packets_decoded < error_if_less_than) {
 	  text_color_set(DW_COLOR_ERROR);
-	  dw_printf ("\n * * * TEST FAILED to achieve minimum of %d * * * \n", error_if_less_than);
-	  exit (1);
+	  dw_printf ("\n * * * TEST FAILED: number decoded is less than %d * * * \n", error_if_less_than);
+	  exit (EXIT_FAILURE);
+	}
+	if (error_if_greater_than != -1 && packets_decoded > error_if_greater_than) {
+	  text_color_set(DW_COLOR_ERROR);
+	  dw_printf ("\n * * * TEST FAILED: number decoded is greater than %d * * * \n", error_if_greater_than);
+	  exit (EXIT_FAILURE);
 	}
 
-	exit (0);
+	exit (EXIT_SUCCESS);
 }
 
 
@@ -539,16 +632,16 @@ int audio_get (int a)
 
 void rdq_append (rrbb_t rrbb)
 {
-	int chan;
+	int chan, subchan, slice;
 	alevel_t alevel;
-	int subchan;
 
 
 	chan = rrbb_get_chan(rrbb);
 	subchan = rrbb_get_subchan(rrbb);
+	slice = rrbb_get_slice(rrbb);
 	alevel = rrbb_get_audio_level(rrbb);
 
-	hdlc_rec2_try_to_fix_later (rrbb, chan, subchan, alevel);
+	hdlc_rec2_try_to_fix_later (rrbb, chan, subchan, slice, alevel);
 	rrbb_delete (rrbb);
 }
 
@@ -557,18 +650,17 @@ void rdq_append (rrbb_t rrbb)
  * This is called when we have a good frame.
  */
 
-void dlq_append (dlq_type_t type, int chan, int subchan, packet_t pp, alevel_t alevel, retry_t retries, char *spectrum)  
+void dlq_rec_frame (int chan, int subchan, int slice, packet_t pp, alevel_t alevel, retry_t retries, char *spectrum)
 {	
 	
 	char stemp[500];
 	unsigned char *pinfo;
 	int info_len;
 	int h;
-	char heard[20];
-	char alevel_text[32];
+	char heard[AX25_MAX_ADDR_LEN];
+	char alevel_text[AX25_ALEVEL_TO_TEXT_SIZE];
 
 	packets_decoded++;
-
 
 	ax25_format_addrs (pp, stemp);
 
@@ -585,7 +677,7 @@ void dlq_append (dlq_type_t type, int chan, int subchan, packet_t pp, alevel_t a
 	if (ax25_get_num_addr(pp) == 0) {
 	  /* Not AX.25. No station to display below. */
 	  h = -1;
-	  strcpy (heard, "");
+	  strlcpy (heard, "", sizeof(heard));
 	}
 	else {
 	  h = ax25_get_heard(pp);
@@ -595,6 +687,15 @@ void dlq_append (dlq_type_t type, int chan, int subchan, packet_t pp, alevel_t a
 	text_color_set(DW_COLOR_DEBUG);
 	dw_printf ("\n");
 	dw_printf("DECODED[%d] ", packets_decoded );
+
+	/* Insert time stamp relative to start of file. */
+
+	double sec = (double)sample_number / my_audio_config.adev[0].samples_per_sec;
+	int min = (int)(sec / 60.);
+	sec -= min * 60;
+
+	dw_printf ("%d:%07.4f ", min, sec);
+
 	if (h != AX25_SOURCE) {
 	  dw_printf ("Digipeater ");
 	}
@@ -609,27 +710,38 @@ void dlq_append (dlq_type_t type, int chan, int subchan, packet_t pp, alevel_t a
 
 #endif
 
-#if defined(EXPERIMENT_G) || defined(EXPERIMENT_H)
-	int j;
-
-	for (j=0; j<MAX_SUBCHANS; j++) {
-	  if (spectrum[j] == '|') {
-	    count[j]++;
-	  }
-	}
-#endif
+//#if defined(EXPERIMENT_G) || defined(EXPERIMENT_H)
+//	int j;
+//
+//	for (j=0; j<MAX_SUBCHANS; j++) {
+//	  if (spectrum[j] == '|') {
+//	    count[j]++;
+//	  }
+//	}
+//#endif
 
 
 // Display non-APRS packets in a different color.
 
-// TODO: display subchannel if appropriate.
+// Display channel with subchannel/slice if applicable.
 
 	if (ax25_is_aprs(pp)) {
 	  text_color_set(DW_COLOR_REC);
-	  dw_printf ("[%d] ", chan);
 	}
 	else {
 	  text_color_set(DW_COLOR_DEBUG);
+	}
+
+	if (my_audio_config.achan[chan].num_subchan > 1 && my_audio_config.achan[chan].num_slicers == 1) {
+	  dw_printf ("[%d.%d] ", chan, subchan);
+	}
+	else if (my_audio_config.achan[chan].num_subchan == 1 && my_audio_config.achan[chan].num_slicers > 1) {
+	  dw_printf ("[%d.%d] ", chan, slice);
+	}
+	else if (my_audio_config.achan[chan].num_subchan > 1 && my_audio_config.achan[chan].num_slicers > 1) {
+	  dw_printf ("[%d.%d.%d] ", chan, subchan, slice);
+	}
+	else {
 	  dw_printf ("[%d] ", chan);
 	}
 
@@ -637,9 +749,27 @@ void dlq_append (dlq_type_t type, int chan, int subchan, packet_t pp, alevel_t a
 	ax25_safe_print ((char *)pinfo, info_len, 0);
 	dw_printf ("\n");
 
+#if 1		// temp experiment  	TODO: remove this.
+
+#include "decode_aprs.h"
+#include "log.h"
+
+	if (ax25_is_aprs(pp)) {
+
+	  decode_aprs_t A;
+
+	  decode_aprs (&A, pp, 0);
+
+	  // Temp experiment to see how different systems set the RR bits in the source and destination.
+	  // log_rr_bits (&A, pp);
+
+	}
+#endif
+
+
 	ax25_delete (pp);
 
-} /* end app_process_rec_packet */
+} /* end fake dlq_append */
 
 
 void ptt_set (int ot, int chan, int ptt_signal)
@@ -647,6 +777,10 @@ void ptt_set (int ot, int chan, int ptt_signal)
 	return;
 }
 
+int get_input (int it, int chan)
+{
+	return -1;
+}
 
 static void usage (void) {
 
@@ -675,6 +809,10 @@ static void usage (void) {
 	dw_printf ("\n");
 	dw_printf ("        -P m   Select  the  demodulator  type such as A, B, C, D (default for 300 baud),\n");
 	dw_printf ("               E (default for 1200 baud), F, A+, B+, C+, D+, E+, F+.\n");
+	dw_printf ("\n");
+	dw_printf ("        -0     Use channel 0 (left) of stereo audio (default).\n");
+	dw_printf ("        -1     use channel 1 (right) of stereo audio.\n");
+	dw_printf ("        -2     decode both channels of stereo audio.\n");
 	dw_printf ("\n");
 	dw_printf ("        wav-file-in is a WAV format audio file.\n");
 	dw_printf ("\n");

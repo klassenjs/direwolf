@@ -1,11 +1,7 @@
-//#define DEBUG 1
-//#define DEBUG_SIM 1
-
-
 //
 //    This file is part of Dire Wolf, an amateur radio packet TNC.
 //
-//    Copyright (C) 2011, 2013, 2014, 2015  John Langner, WB2OSZ
+//    Copyright (C) 2011, 2013, 2014, 2015, 2016, 2017  John Langner, WB2OSZ
 //
 //    This program is free software: you can redistribute it and/or modify
 //    it under the terms of the GNU General Public License as published by
@@ -32,26 +28,26 @@
  *
  *---------------------------------------------------------------*/
 
+//#define DEBUG 1
+
+#include "direwolf.h"
+
+
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <assert.h>
 #include <string.h>
 #include <math.h>
-
 #include <time.h>
-#if __WIN32__
-#include <windows.h>
-#endif
 
-#include "direwolf.h"
+
 #include "ax25_pad.h"
 #include "textcolor.h"
 #include "audio.h"
 #include "tq.h"
 #include "xmit.h"
 #include "config.h"
-#include "digipeater.h"
 #include "version.h"
 #include "encode_aprs.h"
 #include "beacon.h"
@@ -59,16 +55,29 @@
 #include "dwgps.h"
 #include "log.h"
 #include "dlq.h"
+#include "aprs_tt.h"		// for dw_run_cmd - should relocate someday.
+#include "mheard.h"
 
 
+#if __WIN32__
 
 /* 
- * Are we using GPS data?
- * Incremented if tracker beacons configured.  
- * Cleared if dwgps_init fails.
+ * Windows doesn't have localtime_r.
+ * It should have the equivalent localtime_s, with opposite parameter
+ * order,  but I get undefined reference when trying to use it.
  */
 
-static int g_using_gps = 0;	
+struct tm *localtime_r(time_t *clock, struct tm *res)
+{
+	struct tm *tm;
+
+	tm = localtime (clock);
+	memcpy (res, tm, sizeof(struct tm));
+	return (res);
+}
+
+#endif
+
 
 /*
  * Save pointers to configuration settings.
@@ -76,8 +85,7 @@ static int g_using_gps = 0;
 
 static struct audio_s        *g_modem_config_p;
 static struct misc_config_s  *g_misc_config_p;
-static struct digi_config_s  *g_digi_config_p;
-
+static struct igate_config_s *g_igate_config_p;
 
 
 #if __WIN32__
@@ -96,6 +104,11 @@ void beacon_tracker_set_debug (int level)
 	g_tracker_debug_level = level;
 }
 
+static time_t sb_calculate_next_time (time_t now,
+			float current_speed_mph, float current_course,
+			time_t last_xmit_time, float last_xmit_course);
+
+static void beacon_send (int j, dwgps_info_t *gpsinfo);
 
 
 /*-------------------------------------------------------------------
@@ -104,28 +117,31 @@ void beacon_tracker_set_debug (int level)
  *
  * Purpose:     Initialize the beacon process.
  *
- * Inputs:	pmodem		- Aduio device and modem configuration.
- *				  Used only to find valide channels.
+ * Inputs:	pmodem		- Audio device and modem configuration.
+ *				  Used only to find valid channels.
+ *
  *		pconfig		- misc. configuration from config file.
- *		pdigi		- digipeater configuration from config file.
- *				TODO: Is this needed?
+ *				  Beacon stuff ended up here.
+ *
+ *		pigate		- IGate configuration.
+ *				  Need this for calculating IGate statistics.
  *
  *
  * Outputs:	Remember required information for future use.
  *
- * Description:	Initialize the queue to be empty and set up other
- *		mechanisms for sharing it between different threads.
+ * Description:	Do some validity checking on the beacon configuration.
  *
- *		Start up xmit_thread to actually send the packets
+ *		Start up beacon_thread to actually send the packets
  *		at the appropriate time.
  *
  *--------------------------------------------------------------------*/
 
 
 
-void beacon_init (struct audio_s *pmodem, struct misc_config_s *pconfig, struct digi_config_s *pdigi)
+void beacon_init (struct audio_s *pmodem, struct misc_config_s *pconfig, struct igate_config_s *pigate)
 {
 	time_t now;
+	struct tm tm;
 	int j;
 	int count;
 #if __WIN32__
@@ -148,7 +164,7 @@ void beacon_init (struct audio_s *pmodem, struct misc_config_s *pconfig, struct 
  */
 	g_modem_config_p = pmodem;
 	g_misc_config_p = pconfig;
-	g_digi_config_p = pdigi;
+	g_igate_config_p = pigate;
 
 /*
  * Precompute the packet contents so any errors are 
@@ -163,7 +179,9 @@ void beacon_init (struct audio_s *pmodem, struct misc_config_s *pconfig, struct 
 
 	  if (g_modem_config_p->achan[chan].valid) {
 
-	    if (strlen(g_modem_config_p->achan[chan].mycall) > 0 && strcasecmp(g_modem_config_p->achan[chan].mycall, "NOCALL") != 0) {
+	    if (strlen(g_modem_config_p->achan[chan].mycall) > 0 &&
+			 strcasecmp(g_modem_config_p->achan[chan].mycall, "N0CALL") != 0 &&
+			 strcasecmp(g_modem_config_p->achan[chan].mycall, "NOCALL") != 0) {
 
               switch (g_misc_config_p->beacon[j].btype) {
 
@@ -193,26 +211,46 @@ void beacon_init (struct audio_s *pmodem, struct misc_config_s *pconfig, struct 
 
 	        case BEACON_TRACKER:
 
-#if defined(ENABLE_GPS) || defined(DEBUG_SIM)
-		  g_using_gps++;
-#else
-	          text_color_set(DW_COLOR_ERROR);
-	          dw_printf ("Config file, line %d: GPS tracker feature is not enabled.\n", g_misc_config_p->beacon[j].lineno);
-	   	  g_misc_config_p->beacon[j].btype = BEACON_IGNORE;
-	   	  continue;
-#endif
+	          {
+	            dwgps_info_t gpsinfo;
+	            dwfix_t fix;
+
+	            fix = dwgps_read (&gpsinfo);
+		    if (fix == DWFIX_NOT_INIT) {
+
+	              text_color_set(DW_COLOR_ERROR);
+	              dw_printf ("Config file, line %d: GPS must be configured to use TBEACON.\n", g_misc_config_p->beacon[j].lineno);
+	              g_misc_config_p->beacon[j].btype = BEACON_IGNORE;
+	            }
+	          }
 		  break;
 
 	        case BEACON_CUSTOM:
 
-		  /* INFO is required. */
+		  /* INFO or INFOCMD is required. */
 
-		  if (g_misc_config_p->beacon[j].custom_info == NULL) {
+		  if (g_misc_config_p->beacon[j].custom_info == NULL && g_misc_config_p->beacon[j].custom_infocmd == NULL) {
 	            text_color_set(DW_COLOR_ERROR);
-	            dw_printf ("Config file, line %d: INFO is required for custom beacon.\n", g_misc_config_p->beacon[j].lineno);
+	            dw_printf ("Config file, line %d: INFO or INFOCMD is required for custom beacon.\n", g_misc_config_p->beacon[j].lineno);
 		    g_misc_config_p->beacon[j].btype = BEACON_IGNORE;
 		    continue;
 		  }	
+		  break;
+
+	        case BEACON_IGATE:
+
+		  /* Doesn't make sense if IGate is not configured. */
+
+	          if (strlen(g_igate_config_p->t2_server_name) == 0 ||
+	              strlen(g_igate_config_p->t2_login) == 0 ||
+	              strlen(g_igate_config_p->t2_passcode) == 0) {
+
+	            text_color_set(DW_COLOR_ERROR);
+	            dw_printf ("Config file, line %d: Doesn't make sense to use IBEACON without IGate Configured.\n", g_misc_config_p->beacon[j].lineno);
+	            dw_printf ("IBEACON has been disabled.\n");
+		    g_misc_config_p->beacon[j].btype = BEACON_IGNORE;
+		    continue;
+		  }
 		  break;
 
 	        case BEACON_IGNORE:
@@ -233,54 +271,73 @@ void beacon_init (struct audio_s *pmodem, struct misc_config_s *pconfig, struct 
 	}
 
 /*
- * Calculate next time for each beacon.
+ * Calculate first time for each beacon from the 'slot' or 'delay' value.
  */
 
 	now = time(NULL);
+	localtime_r (&now, &tm);
 
 	for (j=0; j<g_misc_config_p->num_beacons; j++) {
+	  struct beacon_s *bp = & (g_misc_config_p->beacon[j]);
 #if DEBUG
 
 	  text_color_set(DW_COLOR_DEBUG);
-	  dw_printf ("beacon[%d] chan=%d, delay=%d, every=%d\n",
+	  dw_printf ("beacon[%d] chan=%d, delay=%d, slot=%d, every=%d\n",
 		j,
-		g_misc_config_p->beacon[j].sendto_chan,
-		g_misc_config_p->beacon[j].delay,
-		g_misc_config_p->beacon[j].every);
+		bp->sendto_chan,
+		bp->delay,
+		bp->slot,
+		bp->every);
 #endif
-	  g_misc_config_p->beacon[j].next = now + g_misc_config_p->beacon[j].delay;
-	}
-
 
 /*
- * Connect to GPS receiver if any tracker beacons are configured.
- * If open fails, disable all tracker beacons.
+ * If timeslots, there must be a full number of beacon intervals per hour.
  */
+#define IS_GOOD(x) ((3600/(x))*(x) == 3600)
 
-#if DEBUG_SIM
+	  if (bp->slot != G_UNKNOWN) {
 
-	g_using_gps = 1;
-	
-#elif ENABLE_GPS
+	    if ( ! IS_GOOD(bp->every)) {
+	      text_color_set(DW_COLOR_ERROR);
+	      dw_printf ("Config file, line %d: When using timeslots, there must be a whole number of beacon intervals per hour.\n", bp->lineno);
 
-	if (g_using_gps > 0) {
-	  int err;
+	      // Try to make it valid by adjusting up or down.
 
-	  err = dwgps_init();
-	  if (err != 0) {
-	    text_color_set(DW_COLOR_ERROR);
-	    dw_printf ("All tracker beacons disabled.\n");
-	    g_using_gps = 0;
-
-	    for (j=0; j<g_misc_config_p->num_beacons; j++) {
-              if (g_misc_config_p->beacon[j].btype == BEACON_TRACKER) {
-		g_misc_config_p->beacon[j].btype = BEACON_IGNORE;
+	      int n;
+	      for (n=1; ; n++) {
+	        int e;
+	        e = bp->every + n;
+	        if (e > 3600) {
+	          bp->every = 3600;
+	          break;
+	        }
+	        if (IS_GOOD(e)) {
+	          bp->every = e;
+	          break;
+	        }
+	        e = bp->every - n;
+	        if (e < 1) {
+	          bp->every = 1;	// Impose a larger minimum?
+	          break;
+	        }
+	        if (IS_GOOD(e)) {
+	          bp->every = e;
+	          break;
+	        }
 	      }
+	      text_color_set(DW_COLOR_ERROR);
+	      dw_printf ("Config file, line %d: Time between slotted beacons has been adjusted to %d seconds.\n", bp->lineno, bp->every);
 	    }
+/*
+ * Determine when next slot time will arrive.
+ */
+	    bp->delay = bp->slot - (tm.tm_min * 60 + tm.tm_sec);
+	    while (bp->delay > bp->every) bp->delay -= bp->every;
+	    while (bp->delay < 5) bp->delay += bp->every;
 	  }
 
+	  g_misc_config_p->beacon[j].next = now + g_misc_config_p->beacon[j].delay;
 	}
-#endif
 
 
 /* 
@@ -341,18 +398,6 @@ void beacon_init (struct audio_s *pmodem, struct misc_config_s *pconfig, struct 
 #define MIN(x,y) ((x) < (y) ? (x) : (y))
 
 
-/* Difference between two angles. */
-
-static inline float heading_change (float a, float b)
-{
-	float diff;
-
-	diff = fabs(a - b);
-	if (diff <= 180.)
-	  return (diff);
-	else
-	  return (360. - diff);
-}
 
 
 #if __WIN32__
@@ -361,29 +406,17 @@ static unsigned __stdcall beacon_thread (void *arg)
 static void * beacon_thread (void *arg)
 #endif
 {
-	int j;
+	int j;				/* Index into array of beacons. */
 	time_t earliest;
-	time_t now;
+	time_t now;			/* Current time. */
+	int number_of_tbeacons;		/* Number of tracker beacons. */
 
-/*
- * Information from GPS.
- */
-	int fix = 0;			/* 0 = none, 2 = 2D, 3 = 3D */
-	double my_lat = 0;		/* degrees */
-	double my_lon = 0;
-	float  my_course = 0;		/* degrees */
-	float  my_speed_knots = 0;
-	float  my_speed_mph = 0;
-	float  my_alt_m = G_UNKNOWN;		/* meters */
-	int    my_alt_ft = G_UNKNOWN;
 
 /*
  * SmartBeaconing state.
  */
 	time_t sb_prev_time = 0;	/* Time of most recent transmission. */
 	float sb_prev_course = 0;	/* Most recent course reported. */
-	//float sb_prev_speed_mph;	/* Most recent speed reported. */
-	int sb_every;			/* Calculated time between transmissions. */
 
 
 #if DEBUG
@@ -391,30 +424,45 @@ static void * beacon_thread (void *arg)
 	char hms[20];
 
 	now = time(NULL);
+
 	localtime_r (&now, &tm);
+
 	strftime (hms, sizeof(hms), "%H:%M:%S", &tm);
 	text_color_set(DW_COLOR_DEBUG);
 	dw_printf ("beacon_thread: started %s\n", hms);
 #endif
+
+/*
+ * See if any tracker beacons are configured.
+ * No need to obtain GPS data if none.
+ */
+
+	number_of_tbeacons = 0;
+	for (j=0; j<g_misc_config_p->num_beacons; j++) {
+	  if (g_misc_config_p->beacon[j].btype == BEACON_TRACKER) {
+	    number_of_tbeacons++;
+	  }
+	}
+
 	now = time(NULL);
 
 	while (1) {
 
-	  assert (g_misc_config_p->num_beacons >= 1);
+	  dwgps_info_t gpsinfo;
 
 /* 
  * Sleep until time for the earliest scheduled or
  * the soonest we could transmit due to corner pegging.
  */
 	  
-	  earliest = g_misc_config_p->beacon[0].next;
-	  for (j=1; j<g_misc_config_p->num_beacons; j++) {
-	    if (g_misc_config_p->beacon[j].btype == BEACON_IGNORE)
-	      continue;
-	    earliest = MIN(g_misc_config_p->beacon[j].next, earliest);
+	  earliest = now + 60 * 60;
+	  for (j=0; j<g_misc_config_p->num_beacons; j++) {
+	    if (g_misc_config_p->beacon[j].btype != BEACON_IGNORE) {
+	      earliest = MIN(g_misc_config_p->beacon[j].next, earliest);
+	    }
 	  }
 
-	  if (g_misc_config_p->sb_configured && g_using_gps) {
+	  if (g_misc_config_p->sb_configured && number_of_tbeacons > 0) {
 	    earliest = MIN(now + g_misc_config_p->sb_turn_time, earliest);
             earliest = MIN(now + g_misc_config_p->sb_fast_rate, earliest);
 	  }
@@ -441,134 +489,263 @@ static void * beacon_thread (void *arg)
  * beacon because corner pegging make it sooner. 
  */
 
-#if DEBUG_SIM
-	  FILE *fp;
-	  char cs[40];
+	  if (number_of_tbeacons > 0) {
 
-	  fp = fopen ("c:\\cygwin\\tmp\\cs", "r");
-	  if (fp != NULL) {
-	    fscanf (fp, "%f %f", &my_course, &my_speed_knots);
-	    fclose (fp);
-	  }
-	  else {
-	    fprintf (stderr, "Can't read /tmp/cs.\n");
-	  }
-	  fix = 3;
-	  my_speed_mph = DW_KNOTS_TO_MPH(my_speed_knots);
-	  my_lat = 42.99;
-	  my_lon = 71.99;
-	  my_alt_m = 100;
-#else
-	  if (g_using_gps) {
-
-	    fix = dwgps_read (&my_lat, &my_lon, &my_speed_knots, &my_course, &my_alt_m);
-	    my_speed_mph = DW_KNOTS_TO_MPH(my_speed_knots);
+	    dwfix_t fix = dwgps_read (&gpsinfo);
+	    float my_speed_mph = DW_KNOTS_TO_MPH(gpsinfo.speed_knots);
 
 	    if (g_tracker_debug_level >= 1) {
 	      struct tm tm;
 	      char hms[20];
 
+
 	      localtime_r (&now, &tm);
 	      strftime (hms, sizeof(hms), "%H:%M:%S", &tm);
 	      text_color_set(DW_COLOR_DEBUG);
 	      if (fix == 3) {
-	        dw_printf ("%s  3D, %.6f, %.6f, %.1f mph, %.0f\xc2\xb0, %.1f m\n", hms, my_lat, my_lon, my_speed_mph, my_course, my_alt_m);
+	        dw_printf ("%s  3D, %.6f, %.6f, %.1f mph, %.0f\xc2\xb0, %.1f m\n", hms, gpsinfo.dlat, gpsinfo.dlon, my_speed_mph, gpsinfo.track, gpsinfo.altitude);
 	      }
 	      else if (fix == 2) {
-	        dw_printf ("%s  2D, %.6f, %.6f, %.1f mph, %.0f\xc2\xb0\n", hms, my_lat, my_lon, my_speed_mph, my_course);
+	        dw_printf ("%s  2D, %.6f, %.6f, %.1f mph, %.0f\xc2\xb0\n", hms, gpsinfo.dlat, gpsinfo.dlon, my_speed_mph, gpsinfo.track);
 	      }
 	      else {
 	        dw_printf ("%s  No GPS fix\n", hms);
 	      }
 	    }
 
-	    /* Transmit altitude only if 3D fix and user asked for it. */
-
-	    my_alt_ft = G_UNKNOWN;
-	    if (fix >= 3 && my_alt_m != G_UNKNOWN && g_misc_config_p->beacon[j].alt_m != G_UNKNOWN) {
-	      my_alt_ft = DW_METERS_TO_FEET(my_alt_m);
-	    }
-
 	    /* Don't complain here for no fix. */
 	    /* Possibly at the point where about to transmit. */
-	  }
-#endif
 
 /*
  * Run SmartBeaconing calculation if configured and GPS data available.
  */
-	  if (g_misc_config_p->sb_configured && g_using_gps && fix >= 2) {
+	    if (g_misc_config_p->sb_configured && fix >= DWFIX_2D) {
 
-	    if (my_speed_mph > g_misc_config_p->sb_fast_speed) {
-	      sb_every = g_misc_config_p->sb_fast_rate;
-	      if (g_tracker_debug_level >= 2) {
-	      	 text_color_set(DW_COLOR_DEBUG);
-		 dw_printf ("my speed %.1f > fast %d mph, interval = %d sec\n", my_speed_mph, g_misc_config_p->sb_fast_speed, sb_every);
-	      } 
-	    }
-	    else if (my_speed_mph < g_misc_config_p->sb_slow_speed) {
-	      sb_every = g_misc_config_p->sb_slow_rate;
-	      if (g_tracker_debug_level >= 2) {
-	      	 text_color_set(DW_COLOR_DEBUG);
-		 dw_printf ("my speed %.1f < slow %d mph, interval = %d sec\n", my_speed_mph, g_misc_config_p->sb_slow_speed, sb_every);
-	      } 
-	    }
-	    else {
-	      /* Can't divide by 0 assuming sb_slow_speed > 0. */
-	      sb_every = ( g_misc_config_p->sb_fast_rate * g_misc_config_p->sb_fast_speed ) / my_speed_mph;
-	      if (g_tracker_debug_level >= 2) {
-	      	 text_color_set(DW_COLOR_DEBUG);
-		 dw_printf ("my speed %.1f mph, interval = %d sec\n", my_speed_mph, sb_every);
-	      } 
-	    }
+	      time_t tnext = sb_calculate_next_time (now, 
+			DW_KNOTS_TO_MPH(gpsinfo.speed_knots), gpsinfo.track,
+			sb_prev_time, sb_prev_course);
 
-#if DEBUG_SIM
+	      for (j=0; j<g_misc_config_p->num_beacons; j++) {
+	        if (g_misc_config_p->beacon[j].btype == BEACON_TRACKER) {
+	          /* Haven't thought about the consequences of SmartBeaconing */
+	          /* and having more than one tbeacon configured. */
+	          if (tnext < g_misc_config_p->beacon[j].next) {
+	             g_misc_config_p->beacon[j].next = tnext;
+	          }
+	        }
+	      }  /* Update next time if sooner. */
+	    }  /* apply SmartBeaconing */
+	  }  /* tbeacon(s) configured. */
+
+/*
+ * Send if the time has arrived.
+ */
+	  for (j=0; j<g_misc_config_p->num_beacons; j++) {
+
+	    struct beacon_s *bp = & (g_misc_config_p->beacon[j]);
+
+	    if (bp->btype == BEACON_IGNORE)
+	      continue;
+
+	    if (bp->next <= now) {
+
+	      /* Send the beacon. */
+
+	      beacon_send (j, &gpsinfo);
+
+	      /* Calculate when the next one should be sent. */
+	      /* Easy for fixed interval.  SmartBeaconing takes more effort. */
+
+	      if (bp->btype == BEACON_TRACKER) {
+
+	        if (gpsinfo.fix < DWFIX_2D) {
+	          /* Fix not available so beacon was not sent. */
+
+		  if (g_misc_config_p->sb_configured) {
+	            /* Try again in a couple seconds. */
+	            bp->next = now + 2;
+	          }
+	          else {
+	            /* Stay with the schedule. */
+	            /* Important for slotted.  Might reconsider otherwise. */
+	            bp->next += bp->every;
+	          }
+	        }
+	        else if (g_misc_config_p->sb_configured) {
+
+		  /* Remember most recent tracker beacon. */
+	          /* Compute next time if not turning. */
+
+		  sb_prev_time = now;
+		  sb_prev_course = gpsinfo.track;
+
+	          bp->next = sb_calculate_next_time (now,
+			DW_KNOTS_TO_MPH(gpsinfo.speed_knots), gpsinfo.track,
+			sb_prev_time, sb_prev_course);
+	        }
+	        else {
+	          /* Tracker beacon, fixed spacing. */
+	          bp->next += bp->every;
+	        }
+	      }
+	      else {
+	        /* Non-tracker beacon, fixed spacing. */
+		/* Increment by 'every' so slotted times come out right. */
+	        /* i.e. Don't take relative to now in case there was some delay. */
+
+	        bp->next += bp->every;
+	      }
+
+	    }  /* if time to send it */
+
+	  }  /* for each configured beacon */
+
+	}  /* do forever */
+
+#if __WIN32__
+	return(0);	/* unreachable but warning if not here. */
+#else 
+	return(NULL);
+#endif
+
+} /* end beacon_thread */
+
+
+/*-------------------------------------------------------------------
+ *
+ * Name:        sb_calculate_next_time
+ *
+ * Purpose:     Calculate next transmission time using the SmartBeaconing algorithm.
+ *
+ * Inputs:	now			- Current time.
+ *
+ *		current_speed_mph	- Current speed from GPS.
+ *				  	  Not expecting G_UNKNOWN but should check for it.
+ *
+ *		current_course		- Current direction of travel.
+ *				  	  Could be G_UNKNOWN if stationary.
+ *
+ *		last_xmit_time		- Time of most recent transmission.
+ *
+ *		last_xmit_course	- Direction included in most recent transmission.
+ *
+ * Global In:	g_misc_config_p->
+ *			sb_configured	TRUE if SmartBeaconing is configured.
+ *			sb_fast_speed	MPH
+ *			sb_fast_rate	seconds
+ *			sb_slow_speed	MPH
+ *			sb_slow_rate	seconds
+ *			sb_turn_time	seconds
+ *			sb_turn_angle	degrees
+ *			sb_turn_slope	degrees * MPH
+ *
+ * Returns:	Time of next transmission.
+ *		Could vary from now to sb_slow_rate in the future.
+ *
+ * Caution:	The algorithm is defined in MPH units.    GPS uses knots.
+ *		The caller must be careful about using the proper conversions.
+ *
+ *--------------------------------------------------------------------*/
+
+/* Difference between two angles. */
+
+static float heading_change (float a, float b)
+{
+	float diff;
+
+	diff = fabs(a - b);
+	if (diff <= 180.)
+	  return (diff);
+	else
+	  return (360. - diff);
+}
+
+static time_t sb_calculate_next_time (time_t now,
+			float current_speed_mph, float current_course,
+			time_t last_xmit_time, float last_xmit_course)
+{
+	int beacon_rate;
+	time_t next_time;
+
+/*
+ * Compute time between beacons for travelling in a straight line.
+ */
+
+	if (current_speed_mph == G_UNKNOWN) {
+	  beacon_rate = (int)roundf((g_misc_config_p->sb_fast_rate + g_misc_config_p->sb_slow_rate) / 2.);
+	}
+	else if (current_speed_mph > g_misc_config_p->sb_fast_speed) {
+	  beacon_rate = g_misc_config_p->sb_fast_rate;
+	}
+	else if (current_speed_mph < g_misc_config_p->sb_slow_speed) {
+	  beacon_rate = g_misc_config_p->sb_slow_rate;
+	}
+	else {
+	  /* Can't divide by 0 assuming sb_slow_speed > 0. */
+	  beacon_rate = (int)roundf(( g_misc_config_p->sb_fast_rate * g_misc_config_p->sb_fast_speed ) / current_speed_mph);
+	}
+
+	if (g_tracker_debug_level >= 2) {
 	  text_color_set(DW_COLOR_DEBUG);
-	  dw_printf ("SB: fast %d %d slow %d %d speed=%.1f every=%d\n",
-			g_misc_config_p->sb_fast_speed, g_misc_config_p->sb_fast_rate,
-			g_misc_config_p->sb_slow_speed, g_misc_config_p->sb_slow_rate,
-			my_speed_mph, sb_every);
-#endif 
-	
+	  dw_printf ("SmartBeaconing: Beacon Rate = %d seconds for %.1f MPH\n", beacon_rate, current_speed_mph);
+	}
+
+	next_time = last_xmit_time + beacon_rate;
+
 /*
  * Test for "Corner Pegging" if moving.
  */
-	    if (my_speed_mph >= 1.0) {
-	      int turn_threshold = g_misc_config_p->sb_turn_angle + 
-			g_misc_config_p->sb_turn_slope / my_speed_mph;
+	if (current_speed_mph != G_UNKNOWN && current_speed_mph >= 1.0 &&
+		current_course != G_UNKNOWN && last_xmit_course != G_UNKNOWN) {
 
-#if DEBUG_SIM
-	  text_color_set(DW_COLOR_DEBUG);
-	  dw_printf ("SB-moving: course %.0f  prev %.0f  thresh %d\n",
-		my_course, sb_prev_course, turn_threshold);
-#endif 
-	      if (heading_change(my_course, sb_prev_course) > turn_threshold &&
-		  now >= sb_prev_time + g_misc_config_p->sb_turn_time) {
+	  float change = heading_change(current_course, last_xmit_course);
+	  float turn_threshold = g_misc_config_p->sb_turn_angle +
+			g_misc_config_p->sb_turn_slope / current_speed_mph;
 
-	        if (g_tracker_debug_level >= 2) {
-	      	   text_color_set(DW_COLOR_DEBUG);
-		   dw_printf ("heading change (%.0f, %.0f) > threshold %d and %d since last >= turn time %d\n",
-				my_course, sb_prev_course, turn_threshold, 
-				(int)(now - sb_prev_time), g_misc_config_p->sb_turn_time);
-	        } 
+	  if (change > turn_threshold &&
+		  now >= last_xmit_time + g_misc_config_p->sb_turn_time) {
 
-		/* Send it now. */
-	        for (j=0; j<g_misc_config_p->num_beacons; j++) {
-                  if (g_misc_config_p->beacon[j].btype == BEACON_TRACKER) {
-		    g_misc_config_p->beacon[j].next = now;
-	          }
-	        }
-	      }  /* significant change in direction */
-	    }  /* is moving */
-	  }  /* apply SmartBeaconing */
-	    
-      
-	  for (j=0; j<g_misc_config_p->num_beacons; j++) {
+	    if (g_tracker_debug_level >= 2) {
+	      text_color_set(DW_COLOR_DEBUG);
+	      dw_printf ("SmartBeaconing: Send now for heading change of %.0f\n", change);
+	    }
 
-	    if (g_misc_config_p->beacon[j].btype == BEACON_IGNORE)
-	      continue;
+	    next_time = now;
+	  }
+	}
 
-	    if (g_misc_config_p->beacon[j].next <= now) {
+	return (next_time);
+
+} /* end sb_calculate_next_time */
+
+
+/*-------------------------------------------------------------------
+ *
+ * Name:        beacon_send
+ *
+ * Purpose:     Transmit one beacon after it was determined to be time.
+ *
+ * Inputs:	j			Index into beacon configuration array below.
+ *
+ *		gpsinfo			Information from GPS.  Used only for TBEACON.
+ *
+ * Global In:	g_misc_config_p->beacon		Array of beacon configurations.
+ *
+ * Outputs:	Destination(s) specified:
+ *		 - Transmit queue.
+ *		 - IGate.
+ *		 - Simulated reception.
+ *
+ * Description:	Prepare text in monitor format.
+ *		Convert to packet object.
+ *		Send to desired destination(s).
+ *
+ *--------------------------------------------------------------------*/
+
+static void beacon_send (int j, dwgps_info_t *gpsinfo)
+{
+
+	struct beacon_s *bp = & (g_misc_config_p->beacon[j]);
 
 	      int strict = 1;	/* Strict packet checking because they will go over air. */
 	      char stemp[20];
@@ -576,7 +753,8 @@ static void * beacon_thread (void *arg)
 	      char beacon_text[AX25_MAX_PACKET_LEN];
 	      packet_t pp = NULL;
 	      char mycall[AX25_MAX_ADDR_LEN];
-	      int alt_ft;
+
+	      char super_comment[AX25_MAX_INFO_LEN];	// Fixed part + any dynamic part.
 
 /*
  * Obtain source call for the beacon.
@@ -588,16 +766,16 @@ static void * beacon_thread (void *arg)
  * Version 1.1 - channel should now be 0 for IGate.  
  * Type of destination is encoded separately.
  */
-	      strcpy (mycall, "NOCALL");
+	      strlcpy (mycall, "NOCALL", sizeof(mycall));
 
-	      assert (g_misc_config_p->beacon[j].sendto_chan >= 0);
+	      assert (bp->sendto_chan >= 0);
 
-	      strcpy (mycall, g_modem_config_p->achan[g_misc_config_p->beacon[j].sendto_chan].mycall);
+	      strlcpy (mycall, g_modem_config_p->achan[bp->sendto_chan].mycall, sizeof(mycall));
 	      
 	      if (strlen(mycall) == 0 || strcmp(mycall, "NOCALL") == 0) {
 	        text_color_set(DW_COLOR_ERROR);
-	        dw_printf ("MYCALL not set for beacon in config file line %d.\n", g_misc_config_p->beacon[j].lineno);
-		continue;
+	        dw_printf ("MYCALL not set for beacon in config file line %d.\n", bp->lineno);
+		return;
 	      }
 
 /* 
@@ -606,90 +784,113 @@ static void * beacon_thread (void *arg)
  * 	src > dest [ , via ]
  */
 
-	      strcpy (beacon_text, mycall);
-	      strcat (beacon_text, ">");
+	      strlcpy (beacon_text, mycall, sizeof(beacon_text));
+	      strlcat (beacon_text, ">", sizeof(beacon_text));
 
-	      if (g_misc_config_p->beacon[j].dest != NULL) {
-	        strcat (beacon_text, g_misc_config_p->beacon[j].dest);
+	      if (bp->dest != NULL) {
+	        strlcat (beacon_text, bp->dest, sizeof(beacon_text));
 	      } 
 	      else {
-	         sprintf (stemp, "%s%1d%1d", APP_TOCALL, MAJOR_VERSION, MINOR_VERSION);
-	         strcat (beacon_text, stemp);
+	         snprintf (stemp, sizeof(stemp), "%s%1d%1d", APP_TOCALL, MAJOR_VERSION, MINOR_VERSION);
+	         strlcat (beacon_text, stemp, sizeof(beacon_text));
 	      }
 
-	      if (g_misc_config_p->beacon[j].via != NULL) {
-	        strcat (beacon_text, ",");
-	        strcat (beacon_text, g_misc_config_p->beacon[j].via);
+	      if (bp->via != NULL) {
+	        strlcat (beacon_text, ",", sizeof(beacon_text));
+	        strlcat (beacon_text, bp->via, sizeof(beacon_text));
 	      }
-	      strcat (beacon_text, ":");
+	      strlcat (beacon_text, ":", sizeof(beacon_text));
+
+
+/*
+ * If the COMMENTCMD option was specified, run specified command to get variable part.
+ * Result is any fixed part followed by any variable part.
+ */
+
+// TODO: test & document.
+
+	      strlcpy (super_comment, "", sizeof(super_comment));
+	      if (bp->comment != NULL) {
+	        strlcpy (super_comment, bp->comment, sizeof(super_comment));
+	      }
+
+	      if (bp->commentcmd != NULL) {
+	        char var_comment[AX25_MAX_INFO_LEN];
+	        int k;
+
+	        /* Run given command to get variable part of comment. */
+
+	        k = dw_run_cmd (bp->commentcmd, 2, var_comment, sizeof(var_comment));
+	        if (k > 0) {
+	          strlcat (super_comment, var_comment, sizeof(super_comment));
+	        }
+	        else {
+		  text_color_set(DW_COLOR_ERROR);
+	          dw_printf ("xBEACON, config file line %d, COMMENTCMD failure.\n", bp->lineno);
+	        }
+	      }
+
 
 /* 
  * Add the info part depending on beacon type. 
  */
-	      switch (g_misc_config_p->beacon[j].btype) {
+	      switch (bp->btype) {
 
 		case BEACON_POSITION:
 
-		  alt_ft = DW_METERS_TO_FEET(g_misc_config_p->beacon[j].alt_m);
-
-		  encode_position (g_misc_config_p->beacon[j].messaging, 
-			g_misc_config_p->beacon[j].compress, g_misc_config_p->beacon[j].lat, g_misc_config_p->beacon[j].lon, alt_ft,
-			g_misc_config_p->beacon[j].symtab, g_misc_config_p->beacon[j].symbol, 
-			g_misc_config_p->beacon[j].power, g_misc_config_p->beacon[j].height, g_misc_config_p->beacon[j].gain, g_misc_config_p->beacon[j].dir,
-			0, 0, /* course, speed */	
-			g_misc_config_p->beacon[j].freq, g_misc_config_p->beacon[j].tone, g_misc_config_p->beacon[j].offset,
-			g_misc_config_p->beacon[j].comment,
-			info);
-		  strcat (beacon_text, info);
-	          g_misc_config_p->beacon[j].next = now + g_misc_config_p->beacon[j].every;
+		  encode_position (bp->messaging, bp->compress,
+			bp->lat, bp->lon, bp->ambiguity,
+			(int)roundf(DW_METERS_TO_FEET(bp->alt_m)),
+			bp->symtab, bp->symbol,
+			bp->power, bp->height, bp->gain, bp->dir,
+			G_UNKNOWN, G_UNKNOWN, /* course, speed */
+			bp->freq, bp->tone, bp->offset,
+			super_comment,
+			info, sizeof(info));
+		  strlcat (beacon_text, info, sizeof(beacon_text));
 		  break;
 
 		case BEACON_OBJECT:
 
-		  encode_object (g_misc_config_p->beacon[j].objname, g_misc_config_p->beacon[j].compress, 0, g_misc_config_p->beacon[j].lat, g_misc_config_p->beacon[j].lon, 
-			g_misc_config_p->beacon[j].symtab, g_misc_config_p->beacon[j].symbol, 
-			g_misc_config_p->beacon[j].power, g_misc_config_p->beacon[j].height, g_misc_config_p->beacon[j].gain, g_misc_config_p->beacon[j].dir,
-			0, 0, /* course, speed */
-			g_misc_config_p->beacon[j].freq, g_misc_config_p->beacon[j].tone, g_misc_config_p->beacon[j].offset, g_misc_config_p->beacon[j].comment,
-			info);
-		  strcat (beacon_text, info);
-	          g_misc_config_p->beacon[j].next = now + g_misc_config_p->beacon[j].every;
+		  encode_object (bp->objname, bp->compress, 0, bp->lat, bp->lon, bp->ambiguity,
+			bp->symtab, bp->symbol,
+			bp->power, bp->height, bp->gain, bp->dir,
+			G_UNKNOWN, G_UNKNOWN, /* course, speed */
+			bp->freq, bp->tone, bp->offset, super_comment,
+			info, sizeof(info));
+		  strlcat (beacon_text, info, sizeof(beacon_text));
 		  break;
 
 		case BEACON_TRACKER:
 
-		  if (fix >= 2) {
-		    int coarse;		/* APRS encoder wants 1 - 360.  */
-					/* 0 means none or unknown. */
+		  if (gpsinfo->fix >= DWFIX_2D) {
 
-		    coarse = (int)roundf(my_course);
-		    if (coarse == 0) {
-		      coarse = 360;
-		    }
-		    encode_position (g_misc_config_p->beacon[j].messaging, 
-			g_misc_config_p->beacon[j].compress, 
-			my_lat, my_lon, my_alt_ft,
-			g_misc_config_p->beacon[j].symtab, g_misc_config_p->beacon[j].symbol, 
-			g_misc_config_p->beacon[j].power, g_misc_config_p->beacon[j].height, g_misc_config_p->beacon[j].gain, g_misc_config_p->beacon[j].dir,
-			coarse, (int)roundf(my_speed_knots),	
-			g_misc_config_p->beacon[j].freq, g_misc_config_p->beacon[j].tone, g_misc_config_p->beacon[j].offset,
-			g_misc_config_p->beacon[j].comment,
-			info);
-		    strcat (beacon_text, info);
+		    int coarse;		/* Round to nearest integer. retaining unknown state. */
+	            int my_alt_ft;
 
-		    /* Remember most recent tracker beacon. */
+	            /* Transmit altitude only if user asked for it. */
+		    /* A positive altitude in the config file enables */
+	            /* transmission of altitude from GPS. */
 
-		    sb_prev_time = now;
-		    sb_prev_course = my_course;
-		    //sb_prev_speed_mph = my_speed_mph;
-
-		    /* Calculate time for next transmission. */
-	            if (g_misc_config_p->sb_configured) {
-	              g_misc_config_p->beacon[j].next = now + sb_every;
+	            my_alt_ft = G_UNKNOWN;
+	            if (gpsinfo->fix >= 3 && gpsinfo->altitude != G_UNKNOWN && bp->alt_m > 0) {
+	              my_alt_ft = (int)roundf(DW_METERS_TO_FEET(gpsinfo->altitude));
 	            }
-	            else {
-	              g_misc_config_p->beacon[j].next = now + g_misc_config_p->beacon[j].every;
+
+		    coarse = G_UNKNOWN;
+		    if (gpsinfo->track != G_UNKNOWN) {
+	              coarse = (int)roundf(gpsinfo->track);
 	            }
+
+		    encode_position (bp->messaging, bp->compress,
+			gpsinfo->dlat, gpsinfo->dlon, bp->ambiguity, my_alt_ft,
+			bp->symtab, bp->symbol,
+			bp->power, bp->height, bp->gain, bp->dir,
+			coarse, (int)roundf(gpsinfo->speed_knots),
+			bp->freq, bp->tone, bp->offset,
+			super_comment,
+			info, sizeof(info));
+		    strlcat (beacon_text, info, sizeof(beacon_text));
 
 		    /* Write to log file for testing. */
 		    /* The idea is to run log2gpx and map the result rather than */
@@ -707,14 +908,14 @@ static void * beacon_thread (void *arg)
 	  	      A.g_tone   = G_UNKNOWN;
 	  	      A.g_dcs    = G_UNKNOWN;
 
-		      strcpy (A.g_src, mycall);
-		      A.g_symbol_table = g_misc_config_p->beacon[j].symtab;
-		      A.g_symbol_code = g_misc_config_p->beacon[j].symbol;
-		      A.g_lat = my_lat;
-		      A.g_lon = my_lon;
-		      A.g_speed = DW_KNOTS_TO_MPH(my_speed_knots);
+		      strlcpy (A.g_src, mycall, sizeof(A.g_src));
+		      A.g_symbol_table = bp->symtab;
+		      A.g_symbol_code = bp->symbol;
+		      A.g_lat = gpsinfo->dlat;
+		      A.g_lon = gpsinfo->dlon;
+		      A.g_speed_mph = DW_KNOTS_TO_MPH(gpsinfo->speed_knots);
 		      A.g_course = coarse;
-		      A.g_altitude = my_alt_ft;
+		      A.g_altitude_ft = DW_METERS_TO_FEET(gpsinfo->altitude);
 
 		      /* Fake channel of 999 to distinguish from real data. */
 		      memset (&alevel, 0, sizeof(alevel));
@@ -722,22 +923,58 @@ static void * beacon_thread (void *arg)
 		    }
 	 	  }
 	          else {
-		    g_misc_config_p->beacon[j].next = now + 2;
-	            continue;   /* No fix.  Try again in a couple seconds. */
+	            return;   /* No fix.  Skip this time. */
 		  }
 		  break;
 
 		case BEACON_CUSTOM:
 
-		  if (g_misc_config_p->beacon[j].custom_info != NULL) {
-	            strcat (beacon_text, g_misc_config_p->beacon[j].custom_info);
+		  if (bp->custom_info != NULL) {
+
+		    /* Fixed handcrafted text. */
+
+	            strlcat (beacon_text, bp->custom_info, sizeof(beacon_text));
+		  }
+		  else if (bp->custom_infocmd != NULL) {
+		    char info_part[AX25_MAX_INFO_LEN];
+		    int k;
+
+	            /* Run given command to obtain the info part for packet. */
+
+		    k = dw_run_cmd (bp->custom_infocmd, 2, info_part, sizeof(info_part));
+		    if (k > 0) {
+	              strlcat (beacon_text, info_part, sizeof(beacon_text));
+	            }
+	            else {
+		      text_color_set(DW_COLOR_ERROR);
+	              dw_printf ("CBEACON, config file line %d, INFOCMD failure.\n", bp->lineno);
+		      strlcpy (beacon_text, "", sizeof(beacon_text));  // abort!
+	            }
 		  }
 		  else {
 		    text_color_set(DW_COLOR_ERROR);
 	    	    dw_printf ("Internal error. custom_info is null. %s %d\n", __FILE__, __LINE__);
-	            continue;
+		    strlcpy (beacon_text, "", sizeof(beacon_text));  // abort!
 	          }
-	          g_misc_config_p->beacon[j].next = now + g_misc_config_p->beacon[j].every;
+		  break;
+
+		case BEACON_IGATE:
+
+	          {
+	            int last_minutes = 30;
+	            char stuff[256];
+
+		    snprintf (stuff, sizeof(stuff), "<IGATE,MSG_CNT=%d,PKT_CNT=%d,DIR_CNT=%d,LOC_CNT=%d,RF_CNT=%d,UPL_CNT=%d,DNL_CNT=%d",
+						igate_get_msg_cnt(),
+						igate_get_pkt_cnt(),
+						mheard_count(0,last_minutes),
+						mheard_count(g_igate_config_p->max_digi_hops,last_minutes),
+						mheard_count(8,last_minutes),
+						igate_get_upl_cnt(),
+						igate_get_dnl_cnt());
+
+		    strlcat (beacon_text, stuff, sizeof(beacon_text));
+	          }
 		  break;
 
 		case BEACON_IGNORE:		
@@ -749,6 +986,10 @@ static void * beacon_thread (void *arg)
 /*
  * Parse monitor format into form for transmission.
  */	
+	      if (strlen(beacon_text) == 0) {
+		return;
+	      }
+	      
 	      pp = ax25_from_text (beacon_text, strict);
 
               if (pp != NULL) {
@@ -758,15 +999,13 @@ static void * beacon_thread (void *arg)
 	        alevel_t alevel;
 
 
-	        switch (g_misc_config_p->beacon[j].sendto_type) {
+	        switch (bp->sendto_type) {
 
 	          case SENDTO_IGATE:
 
-
-#if 1
 	  	    text_color_set(DW_COLOR_XMIT);
 	  	    dw_printf ("[ig] %s\n", beacon_text);
-#endif
+
 		    igate_send_rec_packet (0, pp);
 		    ax25_delete (pp);
 	            break;
@@ -774,30 +1013,25 @@ static void * beacon_thread (void *arg)
 		  case SENDTO_XMIT:
 		  default:
 
-	            tq_append (g_misc_config_p->beacon[j].sendto_chan, TQ_PRIO_1_LO, pp);
+	            tq_append (bp->sendto_chan, TQ_PRIO_1_LO, pp);
 		    break;
 
 		  case SENDTO_RECV:
 
-	            /* Simulated reception. */
+	            /* Simulated reception from radio. */
 
 		    memset (&alevel, 0xff, sizeof(alevel));
-	            dlq_append (DLQ_REC_FRAME, g_misc_config_p->beacon[j].sendto_chan, 0, pp, alevel, 0, "");
+	            dlq_rec_frame (bp->sendto_chan, 0, 0, pp, alevel, 0, "");
 	            break; 
 		}
 	      }
 	      else {
 	        text_color_set(DW_COLOR_ERROR);
-	        dw_printf ("Config file: Failed to parse packet constructed from line %d.\n", g_misc_config_p->beacon[j].lineno);
+	        dw_printf ("Config file: Failed to parse packet constructed from line %d.\n", bp->lineno);
 	        dw_printf ("%s\n", beacon_text);
 	      }
 
-	    }  /* if time to send it */
+} /* end beacon_send */
 
-	  }  /* for each configured beacon */
-
-	}  /* do forever */
-
-} /* end beacon_thread */
 
 /* end beacon.c */

@@ -1,4 +1,3 @@
-
 //
 //    This file is part of Dire Wolf, an amateur radio packet TNC.
 //
@@ -45,18 +44,19 @@
  *---------------------------------------------------------------*/
 
 
+#include "direwolf.h"		// Sets _WIN32_WINNT for XP API level needed by ws2tcpip.h
+
 #if __WIN32__
 
 #include <winsock2.h>
-#undef _WIN32_WINNT
-#define _WIN32_WINNT 0x0501	/* Minimum OS version is XP. */
-#include <ws2tcpip.h>
+#include <ws2tcpip.h>  		// _WIN32_WINNT must be set to 0x0501 before including this
 #else 
 #include <stdlib.h>
 #include <netdb.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/errno.h>
@@ -107,11 +107,10 @@ int main (int argc, char *argv[])
 	char data[1024];
 	char hostname[30] = "localhost";
 	char port[10] = "8000";
+	int err;
 
 #if __WIN32__
 #else
-	int err;
-
  	setlinebuf (stdout);
 #endif
 
@@ -141,12 +140,8 @@ int main (int argc, char *argv[])
 
 	mon_cmd.kind_lo = 'k';
 
-#if __WIN32__	      
-	send (server_sock, (char*)(&mon_cmd), sizeof(mon_cmd), 0);
-#else
-	err = write (server_sock, (char*)(&mon_cmd), sizeof(mon_cmd));
-#endif
-
+	err = SOCK_SEND (server_sock, (char*)(&mon_cmd), sizeof(mon_cmd));
+	(void)err;
 
 /*
  * Print all of the monitored packets.
@@ -155,28 +150,20 @@ int main (int argc, char *argv[])
 	while (1) {
 	  int n;
 
-#if __WIN32__
-	  n = recv (server_sock, (char*)(&mon_cmd), sizeof(mon_cmd), 0);
-#else
-	  n = read (server_sock, (char*)(&mon_cmd), sizeof(mon_cmd));
-#endif
+	  n = SOCK_RECV (server_sock, (char*)(&mon_cmd), sizeof(mon_cmd));
 
 	  if (n != sizeof(mon_cmd)) {
 	    printf ("Read error, received %d command bytes.\n", n);
 	    exit (1);
 	  }
 
-	  assert (mon_cmd.data_len >= 0 && mon_cmd.data_len < sizeof(data));
+	  assert (mon_cmd.data_len >= 0 && mon_cmd.data_len < (int)(sizeof(data)));
 
 	  if (mon_cmd.data_len > 0) {
-#if __WIN32__
-	    n = recv (server_sock, data, mon_cmd.data_len, 0);
-#else
-	    n = read (server_sock, data, mon_cmd.data_len);
-#endif
+	    n = SOCK_RECV (server_sock, data, mon_cmd.data_len);
 
 	    if (n != mon_cmd.data_len) {
-	      printf ("Read error, client received %d data bytes when %d expected.\n", n, mon_cmd.data_len);
+	      printf ("Read error, client received %d data bytes when %d expected.  Terminating.\n", n, mon_cmd.data_len);
 	      exit (1);
 	    }
 	  }
@@ -237,7 +224,7 @@ int main (int argc, char *argv[])
  * Convert to AX.25 frame.
  * Notice that the special destination will cause it to be spoken.
  */
-	      sprintf (reply_text, "N0CALL>SPEECH:%d", n);
+	      snprintf (reply_text, sizeof(reply_text), "N0CALL>SPEECH:%d", n);
 	      reply_pp = ax25_from_text(reply_text, 1);
 
 /*
@@ -252,11 +239,7 @@ int main (int argc, char *argv[])
 	      xmit_raw.hdr.kind_lo = 'K';
 	      xmit_raw.hdr.data_len = 1 + ax25_pack (reply_pp, xmit_raw.frame);
 
-#if __WIN32__	      
-	      send (server_sock, (char*)(&xmit_raw), sizeof(xmit_raw.hdr)+xmit_raw.hdr.data_len, 0);
-#else
-	      err = write (server_sock, (char*)(&xmit_raw), sizeof(xmit_raw.hdr)+xmit_raw.hdr.data_len);
-#endif
+	      err = SOCK_SEND (server_sock, (char*)(&xmit_raw), sizeof(xmit_raw.hdr)+xmit_raw.hdr.data_len);
 	      ax25_delete (reply_pp);
 	    }
 
@@ -355,7 +338,7 @@ static int connect_to_server (char *hostname, char *port)
 
 #if __WIN32__
 #else
-	int e;
+	//int e;
 #endif
 
 #define MAX_HOSTS 30
@@ -425,8 +408,11 @@ static int connect_to_server (char *hostname, char *port)
 	// Try each address until we find one that is successful.
 
 	for (n=0; n<num_hosts; n++) {
+#if __WIN32__
+	  SOCKET is;
+#else
 	  int is;
-
+#endif
 	  ai = hosts[n];
 
 	  ia_to_text (ai->ai_family, ai->ai_addr, ipaddr_str, sizeof(ipaddr_str));
@@ -508,7 +494,7 @@ static char * ia_to_text (int  Family, void * pAddr, char * pStringBuf, size_t S
 	  case AF_INET:
 	    sa4 = (struct sockaddr_in *)pAddr;
 #if __WIN32__
-	    sprintf (pStringBuf, "%d.%d.%d.%d", sa4->sin_addr.S_un.S_un_b.s_b1,
+	    snprintf (pStringBuf, StringBufSize, "%d.%d.%d.%d", sa4->sin_addr.S_un.S_un_b.s_b1,
 						sa4->sin_addr.S_un.S_un_b.s_b2,
 						sa4->sin_addr.S_un.S_un_b.s_b3,
 						sa4->sin_addr.S_un.S_un_b.s_b4);
@@ -519,7 +505,7 @@ static char * ia_to_text (int  Family, void * pAddr, char * pStringBuf, size_t S
 	  case AF_INET6:
 	    sa6 = (struct sockaddr_in6 *)pAddr;
 #if __WIN32__
-	    sprintf (pStringBuf, "%x:%x:%x:%x:%x:%x:%x:%x",  
+	    snprintf (pStringBuf, StringBufSize, "%x:%x:%x:%x:%x:%x:%x:%x",
 					ntohs(((unsigned short *)(&(sa6->sin6_addr)))[0]),
 					ntohs(((unsigned short *)(&(sa6->sin6_addr)))[1]),
 					ntohs(((unsigned short *)(&(sa6->sin6_addr)))[2]),
@@ -533,9 +519,9 @@ static char * ia_to_text (int  Family, void * pAddr, char * pStringBuf, size_t S
 #endif
 	    break;
 	  default:
-	    sprintf (pStringBuf, "Invalid address family!");
+	    snprintf (pStringBuf, StringBufSize, "Invalid address family!");
 	}
-	assert (strlen(pStringBuf) < StringBufSize);
+
 	return pStringBuf;
 
 } /* end ia_to_text */

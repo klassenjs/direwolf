@@ -15,5 +15,14 @@ void server_init (struct audio_s *audio_config_p, struct misc_config_s *misc_con
 
 void server_send_rec_packet (int chan, packet_t pp, unsigned char *fbuf,  int flen);
 
+int server_callsign_registered_by_client (char *callsign);
+
+
+void server_link_established (int chan, int client, char *remote_call, char *own_call, int incoming);
+
+void server_link_terminated (int chan, int client, char *remote_call, char *own_call, int timeout);
+
+void server_rec_conn_data (int chan, int client, char *remote_call, char *own_call, int pid, char *data_ptr, int data_len);
+
 
 /* end server.h */
